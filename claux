@@ -1,0 +1,3002 @@
+--[[
+    Claux UI Library  |  v1.0.0
+    ------------------------------------------------------------------
+    Layout  : Chloex    (Window > Tab > Section > Items)
+    Look    : Neverlose (near-black, blue accent, rounded cards, blur)
+    Config  : Chloex ConfigData/Elements (autosave, named configs, autoload,
+              export/import, key system) + Neverlose Flags / Theme / Unload
+    Removed : drag-to-resize handle (bottom-right corner) from Chloex
+    ------------------------------------------------------------------
+]]
+
+local genv = (getgenv and getgenv()) or _G
+if type(genv.Claux) == "table" and type(genv.Claux.Unload) == "function" then
+    pcall(function() genv.Claux:Unload() end)
+end
+
+----------------------------------------------------------------------
+-- Services / environment
+----------------------------------------------------------------------
+local cloneref = cloneref or function(obj) return obj end
+local function GetService(name)
+    local ok, svc = pcall(function() return cloneref(game:GetService(name)) end)
+    if ok and svc then return svc end
+    return game:GetService(name)
+end
+
+local Players            = GetService("Players")
+local UserInputService   = GetService("UserInputService")
+local TweenService       = GetService("TweenService")
+local RunService         = GetService("RunService")
+local HttpService        = GetService("HttpService")
+local CoreGui            = GetService("CoreGui")
+local Workspace          = GetService("Workspace")
+local Lighting           = GetService("Lighting")
+local MarketplaceService = GetService("MarketplaceService")
+local Stats              = GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+local IsMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+local RGB = Color3.fromRGB
+local FONT, FONT_MED, FONT_BOLD = Enum.Font.Gotham, Enum.Font.GothamMedium, Enum.Font.GothamBold
+
+local Claux = {
+    Version = "1.0.0",
+    Flags = {},            -- Flags[flag] = current value (Neverlose style)
+    Elements = {},         -- Elements[flag] = element object (Chloex style)
+    ConfigData = {},       -- serialized values that get written to disk
+    Connections = {},
+    Keybinds = {},
+    Windows = {},
+    Theme = {},
+    ThemeName = "Neverlose",
+    NotificationsEnabled = true,
+}
+
+local WindowMethods, TabMethods, SectionMethods = {}, {}, {}
+WindowMethods.__index = WindowMethods
+TabMethods.__index = TabMethods
+SectionMethods.__index = SectionMethods
+
+----------------------------------------------------------------------
+-- Small helpers
+----------------------------------------------------------------------
+local noop = function() end
+
+local function Fire(cb, ...)
+    if type(cb) == "function" then task.spawn(cb, ...) end
+end
+
+local function CopyTable(t)
+    local n = {}
+    for k, v in pairs(t) do n[k] = v end
+    return n
+end
+
+local function Clamp(v, a, b) return math.max(a, math.min(b, v)) end
+local function Trim(s) return (tostring(s or ""):gsub("^%s*(.-)%s*$", "%1")) end
+local function GetCamera() return Workspace.CurrentCamera end
+local function RandomName() return "Claux_" .. HttpService:GenerateGUID(false):sub(1, 8) end
+
+local function Connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(Claux.Connections, c)
+    return c
+end
+
+local function Tween(inst, props, time, style, dir)
+    local t = TweenService:Create(inst, TweenInfo.new(time or 0.15, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+    t:Play()
+    return t
+end
+
+-- Instance factory: every GuiObject starts transparent, borderless.
+local function New(class, props)
+    local inst = Instance.new(class)
+    if inst:IsA("GuiObject") then
+        inst.BorderSizePixel = 0
+        inst.BackgroundTransparency = 1
+        if inst:IsA("GuiButton") then inst.AutoButtonColor = false end
+    end
+    if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+        inst.Font = FONT
+        inst.TextSize = 12
+    end
+    local parent
+    if props then
+        for k, v in pairs(props) do
+            if k == "Parent" then parent = v else inst[k] = v end
+        end
+    end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+----------------------------------------------------------------------
+-- Themes (Neverlose-style presets)
+----------------------------------------------------------------------
+local BaseTheme = {
+    Background   = RGB(12, 12, 14),
+    Topbar       = RGB(14, 14, 17),
+    Section      = RGB(15, 15, 18),
+    SectionTop   = RGB(23, 23, 28),
+    Element      = RGB(20, 20, 24),
+    ElementHover = RGB(27, 27, 33),
+    Outline      = RGB(32, 32, 38),
+    ToggleOff    = RGB(42, 42, 50),
+    Text         = RGB(235, 235, 235),
+    SubText      = RGB(140, 140, 152),
+    Accent       = RGB(0, 116, 224),
+    AccentLight  = RGB(0, 195, 255),
+    Danger       = RGB(255, 90, 90),
+    Warning      = RGB(255, 170, 0),
+    Success      = RGB(70, 215, 120),
+}
+
+local function MakeTheme(over)
+    local t = CopyTable(BaseTheme)
+    for k, v in pairs(over) do t[k] = v end
+    return t
+end
+
+local Themes = {
+    Neverlose = BaseTheme,
+    Midnight  = MakeTheme({
+        Background = RGB(13, 12, 18), Topbar = RGB(16, 15, 22), Section = RGB(17, 16, 24),
+        SectionTop = RGB(26, 24, 36), Element = RGB(22, 21, 31), ElementHover = RGB(30, 28, 42),
+        Outline = RGB(36, 34, 50), ToggleOff = RGB(46, 44, 62),
+        Accent = RGB(124, 92, 255), AccentLight = RGB(176, 140, 255),
+    }),
+    Crimson   = MakeTheme({ Accent = RGB(214, 40, 70), AccentLight = RGB(255, 110, 130) }),
+    Emerald   = MakeTheme({ Accent = RGB(16, 163, 110), AccentLight = RGB(72, 225, 170) }),
+}
+Claux.Theme = CopyTable(BaseTheme)
+
+local ThemeBindings, ThemeCallbacks = {}, {}
+
+local function BindTheme(inst, prop, key)
+    pcall(function() inst[prop] = Claux.Theme[key] end)
+    table.insert(ThemeBindings, { Inst = inst, Prop = prop, Key = key })
+end
+
+local function OnTheme(inst, fn)
+    fn(Claux.Theme)
+    table.insert(ThemeCallbacks, { Inst = inst, Fn = fn })
+end
+
+local function ApplyTheme()
+    local root = Claux.Gui
+    if not root then return end
+    for i = #ThemeBindings, 1, -1 do
+        local b = ThemeBindings[i]
+        if b.Inst:IsDescendantOf(root) then
+            pcall(function() b.Inst[b.Prop] = Claux.Theme[b.Key] end)
+        else
+            table.remove(ThemeBindings, i)
+        end
+    end
+    for i = #ThemeCallbacks, 1, -1 do
+        local c = ThemeCallbacks[i]
+        if c.Inst:IsDescendantOf(root) then
+            pcall(c.Fn, Claux.Theme)
+        else
+            table.remove(ThemeCallbacks, i)
+        end
+    end
+end
+
+function Claux:SetTheme(name)
+    local t = Themes[name]
+    if not t then return false end
+    self.ThemeName = name
+    self.Theme = CopyTable(t)
+    ApplyTheme()
+    return true
+end
+
+function Claux:SetAccent(color, light)
+    if typeof(color) ~= "Color3" then return end
+    self.Theme.Accent = color
+    self.Theme.AccentLight = light or color:Lerp(Color3.new(1, 1, 1), 0.35)
+    ApplyTheme()
+end
+
+function Claux:AddTheme(name, overrides)
+    if type(name) == "string" and type(overrides) == "table" then
+        Themes[name] = MakeTheme(overrides)
+    end
+end
+
+function Claux:GetThemes()
+    local list = {}
+    for name in pairs(Themes) do table.insert(list, name) end
+    table.sort(list)
+    return list
+end
+
+----------------------------------------------------------------------
+-- Tiny UI helpers
+----------------------------------------------------------------------
+local function Corner(parent, r)
+    return New("UICorner", { CornerRadius = UDim.new(0, r or 6), Parent = parent })
+end
+
+local function Stroke(parent, key, thickness)
+    local s = New("UIStroke", { Thickness = thickness or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = parent })
+    BindTheme(s, "Color", key or "Outline")
+    return s
+end
+
+local function Pad(parent, l, r, t, b)
+    return New("UIPadding", {
+        PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
+        PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+        Parent = parent,
+    })
+end
+
+local function List(parent, padding, dir, halign, valign)
+    return New("UIListLayout", {
+        Padding = UDim.new(0, padding or 0),
+        FillDirection = dir or Enum.FillDirection.Vertical,
+        HorizontalAlignment = halign or Enum.HorizontalAlignment.Left,
+        VerticalAlignment = valign or Enum.VerticalAlignment.Top,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = parent,
+    })
+end
+
+local function AccentGradient(parent, rotation)
+    local g = New("UIGradient", { Rotation = rotation or 0, Parent = parent })
+    OnTheme(parent, function(t) g.Color = ColorSequence.new(t.Accent, t.AccentLight) end)
+    return g
+end
+
+----------------------------------------------------------------------
+-- File system helpers
+----------------------------------------------------------------------
+local HasFS = type(writefile) == "function" and type(readfile) == "function"
+    and type(isfile) == "function" and type(isfolder) == "function" and type(makefolder) == "function"
+
+local function EnsureFolder(path)
+    if not HasFS then return end
+    local current = ""
+    for part in string.gmatch(path, "[^/\\]+") do
+        current = (current == "") and part or (current .. "/" .. part)
+        local ok, exists = pcall(isfolder, current)
+        if ok and not exists then pcall(makefolder, current) end
+    end
+end
+
+local function EnsureFolderForFile(path)
+    local dir = path:match("^(.*)[/\\][^/\\]+$")
+    if dir then EnsureFolder(dir) end
+end
+
+local function SafeRead(path)
+    if not HasFS or not path then return nil end
+    local ok, exists = pcall(isfile, path)
+    if not ok or not exists then return nil end
+    local ok2, data = pcall(readfile, path)
+    if ok2 and type(data) == "string" and data ~= "" then return data end
+    return nil
+end
+
+local function SafeWrite(path, data)
+    if not HasFS or not path then return false end
+    EnsureFolderForFile(path)
+    return (pcall(writefile, path, data))
+end
+
+local function SafeJSONDecode(str)
+    local ok, res = pcall(function() return HttpService:JSONDecode(str) end)
+    if ok then return res end
+    return nil
+end
+
+local function JSONEncode(t)
+    local ok, res = pcall(function() return HttpService:JSONEncode(t) end)
+    if ok then return res end
+    return "{}"
+end
+
+local function SanitizeName(name)
+    name = tostring(name or "")
+    name = name:gsub("[^%w_ %-]", "")
+    name = name:gsub("%s+", "_")
+    return name
+end
+
+local B64CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function B64Encode(data)
+    local out = {}
+    for i = 1, #data, 3 do
+        local a, b, c = string.byte(data, i, i + 2)
+        local n = a * 65536 + (b or 0) * 256 + (c or 0)
+        local c1 = math.floor(n / 262144) % 64
+        local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64
+        local c4 = n % 64
+        out[#out + 1] = B64CHARS:sub(c1 + 1, c1 + 1) .. B64CHARS:sub(c2 + 1, c2 + 1)
+            .. (b and B64CHARS:sub(c3 + 1, c3 + 1) or "=") .. (c and B64CHARS:sub(c4 + 1, c4 + 1) or "=")
+    end
+    return table.concat(out)
+end
+
+local function B64Decode(data)
+    data = data:gsub("[^%w%+/=]", "")
+    local map = {}
+    for i = 1, #B64CHARS do map[B64CHARS:sub(i, i)] = i - 1 end
+    local out = {}
+    for i = 1, #data, 4 do
+        local s = data:sub(i, i + 3)
+        local c1, c2 = map[s:sub(1, 1)], map[s:sub(2, 2)]
+        local c3, c4 = map[s:sub(3, 3)], map[s:sub(4, 4)]
+        if not c1 or not c2 then break end
+        local n = c1 * 262144 + c2 * 4096 + (c3 or 0) * 64 + (c4 or 0)
+        out[#out + 1] = string.char(math.floor(n / 65536) % 256)
+        if c3 then out[#out + 1] = string.char(math.floor(n / 256) % 256) end
+        if c4 then out[#out + 1] = string.char(n % 256) end
+    end
+    return table.concat(out)
+end
+
+local function SetClipboard(text)
+    local fn = setclipboard or toclipboard or (syn and syn.write_clipboard)
+    if fn then return (pcall(fn, text)) end
+    return false
+end
+
+----------------------------------------------------------------------
+-- Icons (Lucide) + logo
+----------------------------------------------------------------------
+local Lucide, LucideTried
+local LucideCache = {}
+
+local function GetLucide()
+    if LucideTried then return Lucide end
+    LucideTried = true
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://github.com/latte-soft/lucide-roblox/releases/latest/download/lucide-roblox.luau"))()
+    end)
+    if ok and type(res) == "table" then Lucide = res end
+    return Lucide
+end
+
+local function ApplyIcon(img, name, size)
+    if type(name) ~= "string" or name == "" then return false end
+    if name:match("^rbxassetid://") or name:match("^rbxthumb://") or name:match("^%d+$") then
+        img.Image = name:match("^%d+$") and ("rbxassetid://" .. name) or name
+        return true
+    end
+    local lib = GetLucide()
+    if lib then
+        local asset = LucideCache[name]
+        if asset == nil then
+            local ok, res = pcall(function() return lib.GetAsset(name, 48) end)
+            asset = (ok and res) or false
+            LucideCache[name] = asset
+        end
+        if asset then
+            img.Image = asset.Url
+            img.ImageRectOffset = asset.ImageRectOffset
+            img.ImageRectSize = asset.ImageRectSize
+            return true
+        end
+    end
+    return false
+end
+
+-- Returns holder (Frame of size x size) and the inner icon instance (or nil).
+local function MakeIcon(parent, name, size, colorKey, fallback)
+    size = size or 16
+    local holder = New("Frame", { Size = UDim2.fromOffset(size, size), Parent = parent })
+    local img = New("ImageLabel", { Size = UDim2.fromScale(1, 1), Parent = holder })
+    local ok = ApplyIcon(img, name, size)
+    local inner = img
+    if ok then
+        if colorKey then BindTheme(img, "ImageColor3", colorKey) end
+    else
+        img:Destroy()
+        inner = nil
+        if fallback then
+            inner = New("TextLabel", {
+                Size = UDim2.fromScale(1, 1), Text = fallback, Font = FONT_BOLD,
+                TextSize = math.max(10, size - 2), Parent = holder,
+            })
+            if colorKey then BindTheme(inner, "TextColor3", colorKey) end
+        end
+    end
+    return holder, inner
+end
+
+local function ResolveImage(image)
+    if image == nil or image == "" then return nil end
+    image = tostring(image)
+    if image:match("^%d+$") then return "rbxassetid://" .. image end
+    if image:match("^rbxassetid://") or image:match("^rbxthumb://") or image:match("^rbxasset://") then return image end
+    if image:match("^https?://") and HasFS and type(getcustomasset) == "function" then
+        local sum = 0
+        for i = 1, #image do sum = (sum * 31 + image:byte(i)) % 2147483647 end
+        local path = "Claux/Assets/" .. sum .. ".png"
+        if not isfile(path) then
+            local ok, data = pcall(function() return game:HttpGet(image) end)
+            if not ok or not data then return nil end
+            SafeWrite(path, data)
+        end
+        local ok, asset = pcall(getcustomasset, path)
+        if ok then return asset end
+    end
+    return nil
+end
+
+local function MakeLogo(parent, size, image)
+    local holder = New("Frame", { Size = UDim2.fromOffset(size, size), Parent = parent })
+    Corner(holder, math.floor(size * 0.28))
+    local resolved = ResolveImage(image)
+    if resolved then
+        local img = New("ImageLabel", { Size = UDim2.fromScale(1, 1), Image = resolved, Parent = holder })
+        Corner(img, math.floor(size * 0.28))
+    else
+        holder.BackgroundTransparency = 0
+        holder.BackgroundColor3 = Color3.new(1, 1, 1)
+        AccentGradient(holder, 45)
+        New("TextLabel", {
+            Size = UDim2.fromScale(1, 1), Text = "C", Font = FONT_BOLD,
+            TextSize = math.floor(size * 0.6), TextColor3 = Color3.new(1, 1, 1), Parent = holder,
+        })
+    end
+    return holder
+end
+
+----------------------------------------------------------------------
+-- Global GUI root, drag manager, keybind dispatcher, popups
+----------------------------------------------------------------------
+local ActiveDrag, ActiveDragPage
+
+-- Generic "press and drag" helper (sliders, colour picker areas...)
+local function Draggable(btn, cb, page)
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ActiveDrag = cb
+            if page then
+                page.ScrollingEnabled = false
+                ActiveDragPage = page
+            end
+            cb(input.Position)
+        end
+    end)
+end
+
+local function SetupInput()
+    Connect(UserInputService.InputChanged, function(input)
+        if ActiveDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            ActiveDrag(input.Position)
+        end
+    end)
+
+    Connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ActiveDrag = nil
+            if ActiveDragPage then
+                ActiveDragPage.ScrollingEnabled = true
+                ActiveDragPage = nil
+            end
+        elseif input.UserInputType == Enum.UserInputType.Keyboard then
+            for _, kb in ipairs(Claux.Keybinds) do
+                if kb._Release then kb:_Release(input.KeyCode) end
+            end
+        end
+    end)
+
+    Connect(UserInputService.InputBegan, function(input, processed)
+        if Claux.Listening then
+            if input.UserInputType == Enum.UserInputType.Keyboard then
+                local el = Claux.Listening
+                Claux.Listening = nil
+                if input.KeyCode == Enum.KeyCode.Escape then el:SetKey(nil) else el:SetKey(input.KeyCode) end
+            end
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if UserInputService:GetFocusedTextBox() then return end
+
+        -- Search shortcuts (Ctrl+O / Ctrl+Shift+F), same as Chloex
+        local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+        local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+        if ctrl and ((input.KeyCode == Enum.KeyCode.O) or (shift and input.KeyCode == Enum.KeyCode.F)) then
+            for _, w in ipairs(Claux.Windows) do
+                if w.Visible then w:FocusSearch() end
+            end
+            return
+        end
+
+        if processed then return end
+        for _, kb in ipairs(Claux.Keybinds) do
+            if kb._Press then kb:_Press(input.KeyCode) end
+        end
+    end)
+end
+
+local function EnsureGui()
+    if Claux.Gui and Claux.Gui.Parent then return Claux.Gui end
+
+    local gui = New("ScreenGui", {
+        Name = RandomName(), ResetOnSpawn = false, IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 9999,
+    })
+    if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+
+    local parent
+    if type(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then parent = h end
+    end
+    local ok = pcall(function() gui.Parent = parent or CoreGui end)
+    if not ok or not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+    Claux.Gui = gui
+
+    Claux.PopupLayer = New("Frame", { Name = "Popups", Size = UDim2.fromScale(1, 1), ZIndex = 100, Parent = gui })
+    Claux.PopupCatcher = New("TextButton", { Size = UDim2.fromScale(1, 1), Text = "", Visible = false, ZIndex = 1, Parent = Claux.PopupLayer })
+    Connect(Claux.PopupCatcher.Activated, function() Claux:_ClosePopup() end)
+
+    Claux.NotifyHolder = New("Frame", {
+        Name = "Notifications", AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
+        Size = UDim2.new(0, 300, 1, -32), ZIndex = 200, Parent = gui,
+    })
+    List(Claux.NotifyHolder, 8, Enum.FillDirection.Vertical, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Bottom)
+
+    SetupInput()
+    return gui
+end
+
+function Claux:_OpenPopup(anchor, frame, w, h, onClose)
+    self:_ClosePopup()
+    local cam = GetCamera()
+    local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local ap, as = anchor.AbsolutePosition, anchor.AbsoluteSize
+    local x = Clamp(ap.X + as.X - w, 6, math.max(6, vp.X - w - 6))
+    local y = ap.Y + as.Y + 4
+    if y + h > vp.Y - 6 then y = math.max(6, ap.Y - h - 4) end
+    frame.Size = UDim2.fromOffset(w, h)
+    frame.Position = UDim2.fromOffset(x, y)
+    frame.Visible = true
+    self.PopupCatcher.Visible = true
+    self.CurrentPopup = { Frame = frame, OnClose = onClose }
+end
+
+function Claux:_ClosePopup()
+    local p = self.CurrentPopup
+    self.CurrentPopup = nil
+    if p then
+        p.Frame.Visible = false
+        if p.OnClose then pcall(p.OnClose) end
+    end
+    if self.PopupCatcher then self.PopupCatcher.Visible = false end
+end
+
+function Claux:Confirm(title, text, yesText, onYes)
+    EnsureGui()
+    local overlay = New("TextButton", {
+        Size = UDim2.fromScale(1, 1), Text = "", BackgroundTransparency = 0.45,
+        BackgroundColor3 = Color3.new(0, 0, 0), ZIndex = 400, Parent = self.Gui,
+    })
+    local card = New("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(300, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 0, Parent = overlay,
+    })
+    BindTheme(card, "BackgroundColor3", "Background")
+    Corner(card, 10)
+    Stroke(card, "Outline")
+    Pad(card, 16, 16, 14, 14)
+    List(card, 8)
+
+    local t = New("TextLabel", { Size = UDim2.new(1, 0, 0, 20), Text = title or "Confirm", Font = FONT_BOLD, TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1, Parent = card })
+    BindTheme(t, "TextColor3", "Text")
+    local d = New("TextLabel", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Text = text or "", TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextSize = 12, LayoutOrder = 2, Parent = card })
+    BindTheme(d, "TextColor3", "SubText")
+
+    local row = New("Frame", { Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 3, Parent = card })
+    List(row, 8, Enum.FillDirection.Horizontal)
+
+    local function MakeBtn(text2, accent, cb)
+        local b = New("TextButton", { Size = UDim2.new(0.5, -4, 1, 0), Text = text2, Font = FONT_MED, TextSize = 12, BackgroundTransparency = 0, Parent = row })
+        Corner(b, 6)
+        if accent then
+            b.BackgroundColor3 = Color3.new(1, 1, 1)
+            AccentGradient(b, 0)
+            b.TextColor3 = Color3.new(1, 1, 1)
+        else
+            BindTheme(b, "BackgroundColor3", "Element")
+            BindTheme(b, "TextColor3", "Text")
+            Stroke(b, "Outline")
+        end
+        b.Activated:Connect(cb)
+        return b
+    end
+    MakeBtn("Cancel", false, function() overlay:Destroy() end)
+    MakeBtn(yesText or "Yes", true, function()
+        overlay:Destroy()
+        Fire(onYes)
+    end)
+end
+
+----------------------------------------------------------------------
+-- Notifications
+----------------------------------------------------------------------
+local ActiveNotifs = {}
+
+function Claux:Notify(cfg)
+    if type(cfg) == "string" then cfg = { Content = cfg } end
+    cfg = cfg or {}
+    if self.NotificationsEnabled == false and not cfg.Force then return end
+    EnsureGui()
+
+    local keyMap = { Info = "Accent", Success = "Success", Warning = "Warning", Error = "Danger", Danger = "Danger" }
+    local color = cfg.Color or self.Theme[keyMap[cfg.Type or "Info"] or "Accent"]
+    local duration = cfg.Duration or cfg.Delay or 4
+
+    self.NotifyCount = (self.NotifyCount or 0) + 1
+    local wrap = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self.NotifyCount, Parent = self.NotifyHolder })
+    local card = New("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        Position = UDim2.new(1, 40, 0, 0), BackgroundTransparency = 0, Parent = wrap,
+    })
+    BindTheme(card, "BackgroundColor3", "Section")
+    Corner(card, 8)
+    Stroke(card, "Outline")
+
+    local stripe = New("Frame", { Size = UDim2.new(0, 3, 1, -14), Position = UDim2.fromOffset(6, 7), BackgroundTransparency = 0, BackgroundColor3 = color, Parent = card })
+    Corner(stripe, 2)
+
+    local body = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = card })
+    Pad(body, 18, 12, 9, 13)
+    List(body, 2)
+
+    local title = New("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Text = cfg.Title or "Claux", Font = FONT_BOLD, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1, Parent = body })
+    BindTheme(title, "TextColor3", "Text")
+
+    if cfg.Description and cfg.Description ~= "" then
+        local sub = New("TextLabel", { Size = UDim2.new(1, 0, 0, 13), Text = cfg.Description, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 2, Parent = body })
+        BindTheme(sub, "TextColor3", "SubText")
+    end
+
+    local content = cfg.Content or cfg.Text or ""
+    if content ~= "" then
+        local c = New("TextLabel", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Text = content, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextSize = 12, LayoutOrder = 3, Parent = body })
+        BindTheme(c, "TextColor3", "Text")
+    end
+
+    local bar = New("Frame", { Position = UDim2.new(0, 0, 1, -2), Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 0.25, BackgroundColor3 = color, Parent = card })
+    local click = New("TextButton", { Size = UDim2.fromScale(1, 1), Text = "", Parent = card })
+
+    local closed = false
+    local function Close()
+        if closed then return end
+        closed = true
+        local idx = table.find(ActiveNotifs, Close)
+        if idx then table.remove(ActiveNotifs, idx) end
+        Tween(card, { Position = UDim2.new(1, 40, 0, 0) }, 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+        task.delay(0.3, function() wrap:Destroy() end)
+    end
+    click.Activated:Connect(Close)
+
+    table.insert(ActiveNotifs, Close)
+    if #ActiveNotifs > 5 then
+        local oldest = ActiveNotifs[1]
+        oldest()
+    end
+
+    Tween(card, { Position = UDim2.new(0, 0, 0, 0) }, 0.3, Enum.EasingStyle.Quint)
+    Tween(bar, { Size = UDim2.new(0, 0, 0, 2) }, duration, Enum.EasingStyle.Linear)
+    task.delay(duration, Close)
+
+    return { Close = Close }
+end
+Claux.MakeNotify = Claux.Notify -- Chloex compatibility
+
+----------------------------------------------------------------------
+-- Discord helper
+----------------------------------------------------------------------
+local function JoinDiscord(link)
+    link = tostring(link or "")
+    local code = link:match("discord%.gg/([%w%-_]+)") or link:match("discord%.com/invite/([%w%-_]+)") or link
+    local url = "https://discord.gg/" .. code
+    local copied = SetClipboard(url)
+    local req = (syn and syn.request) or request or http_request
+    if req then
+        pcall(function()
+            req({
+                Url = "http://127.0.0.1:6463/rpc?v=1", Method = "POST",
+                Headers = { ["Content-Type"] = "application/json", Origin = "https://discord.com" },
+                Body = HttpService:JSONEncode({ cmd = "INVITE_BROWSER", args = { code = code }, nonce = HttpService:GenerateGUID(false) }),
+            })
+        end)
+    end
+    Claux:Notify({ Title = "Discord", Content = copied and "Link invite disalin ke clipboard." or url, Type = "Success" })
+end
+
+----------------------------------------------------------------------
+-- Key system gate (from Chloex, restyled)
+----------------------------------------------------------------------
+local function RunKeyGate(KeyConfig, Scope)
+    KeyConfig = type(KeyConfig) == "table" and KeyConfig or {}
+    local saveKey = KeyConfig.SaveKey ~= false
+    local scope = SanitizeName(Scope)
+    local fileName = KeyConfig.FileName or ("Claux/Config/" .. (scope ~= "" and (scope .. "_key.txt") or "key.txt"))
+
+    local function IsValid(key)
+        if key == "" then return false end
+        if type(KeyConfig.Validate) == "function" then
+            local ok, res = pcall(KeyConfig.Validate, key)
+            return ok and res == true
+        end
+        if type(KeyConfig.Keys) == "table" then
+            for _, k in ipairs(KeyConfig.Keys) do
+                if tostring(k) == key then return true end
+            end
+        end
+        return false
+    end
+
+    if saveKey then
+        local saved = SafeRead(fileName)
+        if saved and IsValid(Trim(saved)) then return true end
+    end
+
+    local gui = EnsureGui()
+    local result
+    local overlay = New("Frame", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0.4,
+        BackgroundColor3 = Color3.new(0, 0, 0), Active = true, ZIndex = 300, Parent = gui,
+    })
+    local card = New("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(340, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 0, Parent = overlay,
+    })
+    BindTheme(card, "BackgroundColor3", "Background")
+    Corner(card, 10)
+    Stroke(card, "Outline")
+
+    local inner = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = card })
+    Pad(inner, 16, 16, 14, 16)
+    List(inner, 10)
+
+    local title = New("TextLabel", {
+        Size = UDim2.new(1, -30, 0, 22), Text = KeyConfig.Title or "Claux", Font = FONT_BOLD, TextSize = 17,
+        TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1, Parent = inner,
+    })
+    AccentGradient(title, 0)
+
+    local note = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+        Text = KeyConfig.Note or "Masukkan key kamu di bawah ini untuk melanjutkan.",
+        TextXAlignment = Enum.TextXAlignment.Left, TextSize = 12, LayoutOrder = 2, Parent = inner,
+    })
+    BindTheme(note, "TextColor3", "SubText")
+
+    local box = New("TextBox", {
+        Size = UDim2.new(1, 0, 0, 32), Text = "", PlaceholderText = "Enter key...", ClearTextOnFocus = false,
+        TextSize = 12, BackgroundTransparency = 0, LayoutOrder = 3, Parent = inner,
+    })
+    BindTheme(box, "BackgroundColor3", "Element")
+    BindTheme(box, "TextColor3", "Text")
+    BindTheme(box, "PlaceholderColor3", "SubText")
+    Corner(box, 6)
+    Stroke(box, "Outline")
+    Pad(box, 10, 10, 0, 0)
+
+    local status = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 14), Text = "", TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = 4, Parent = inner,
+    })
+    local function SetStatus(text, key)
+        status.Text = text
+        status.TextColor3 = Claux.Theme[key or "SubText"]
+    end
+
+    local row = New("Frame", { Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 5, Parent = inner })
+    List(row, 8, Enum.FillDirection.Horizontal)
+
+    local link = KeyConfig.Link or KeyConfig.GetKeyLink or KeyConfig.Url
+    local submit = New("TextButton", {
+        Size = UDim2.new(link and 0.5 or 1, link and -4 or 0, 1, 0), Text = "Submit", Font = FONT_MED, TextSize = 13,
+        TextColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1),
+        LayoutOrder = 1, Parent = row,
+    })
+    Corner(submit, 6)
+    AccentGradient(submit, 0)
+
+    if link then
+        local get = New("TextButton", {
+            Size = UDim2.new(0.5, -4, 1, 0), Text = "Get Key", Font = FONT_MED, TextSize = 13,
+            BackgroundTransparency = 0, LayoutOrder = 2, Parent = row,
+        })
+        BindTheme(get, "BackgroundColor3", "Element")
+        BindTheme(get, "TextColor3", "Text")
+        Corner(get, 6)
+        Stroke(get, "Outline")
+        get.Activated:Connect(function()
+            local ok = SetClipboard(tostring(link))
+            SetStatus(ok and "Link key disalin ke clipboard." or tostring(link), "Success")
+        end)
+    end
+
+    local closeBtn = New("TextButton", {
+        AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 10), Size = UDim2.fromOffset(24, 24),
+        Text = "x", Font = FONT_BOLD, TextSize = 14, Parent = card,
+    })
+    BindTheme(closeBtn, "TextColor3", "SubText")
+    closeBtn.Activated:Connect(function() result = false end)
+
+    local busy = false
+    local function Submit()
+        if busy then return end
+        local key = Trim(box.Text)
+        if key == "" then
+            SetStatus("Key tidak boleh kosong.", "Warning")
+            return
+        end
+        busy = true
+        SetStatus("Memeriksa key...", "SubText")
+        task.spawn(function()
+            if IsValid(key) then
+                if saveKey then SafeWrite(fileName, key) end
+                SetStatus("Key valid!", "Success")
+                task.wait(0.35)
+                result = true
+            else
+                SetStatus("Key tidak valid.", "Danger")
+                busy = false
+            end
+        end)
+    end
+    submit.Activated:Connect(Submit)
+    box.FocusLost:Connect(function(enter) if enter then Submit() end end)
+
+    while result == nil do
+        if not overlay.Parent then result = false break end
+        task.wait(0.1)
+    end
+    overlay:Destroy()
+    return result == true
+end
+
+----------------------------------------------------------------------
+-- Config system (Chloex ConfigData/Elements + Neverlose Flags)
+----------------------------------------------------------------------
+local Cfg = {
+    Version = 1, VersionReset = false, Applying = false, SaveQueued = false, AutoSave = true,
+    ActiveName = nil, Folder = "Default", File = nil, Dir = nil, AutoloadFile = nil, GameName = "Unknown",
+}
+
+local InternalKeys = {
+    _version = true, _meta = true, Game = true, Version = true, PlaceId = true,
+    Hub = true, SavedAt = true, ActiveConfig = true, AutoLoad = true,
+}
+
+local function SetupPaths(folder)
+    local f = SanitizeName(folder)
+    if f == "" then f = "Default" end
+    Cfg.Folder = f
+    Cfg.File = "Claux/Config/" .. f .. ".json"
+    Cfg.Dir = "Claux/Configs/" .. f
+    Cfg.AutoloadFile = Cfg.Dir .. "/_autoload.txt"
+end
+
+local function GetGameName()
+    local id = game.PlaceId
+    local cache = "Claux/GameName_" .. tostring(id) .. ".txt"
+    local cached = SafeRead(cache)
+    if cached then return cached end
+    local ok, info = pcall(function() return MarketplaceService:GetProductInfo(id) end)
+    local name = ""
+    if ok and info and info.Name then name = SanitizeName(info.Name) end
+    if name == "" then name = "Place_" .. tostring(id) else SafeWrite(cache, name) end
+    return name
+end
+
+local function BuildPayload()
+    return {
+        _meta = { Hub = "Claux", Game = Cfg.GameName, PlaceId = game.PlaceId, Version = Cfg.Version, SavedAt = os.time(), ActiveConfig = Cfg.ActiveName },
+        Data = Claux:GetConfigSnapshot(),
+    }
+end
+
+local function ExtractData(payload)
+    if type(payload) ~= "table" then return nil end
+    local data = payload
+    if type(payload.Data) == "table" then data = payload.Data
+    elseif type(payload.Config) == "table" then data = payload.Config
+    elseif type(payload.Settings) == "table" then data = payload.Settings end
+    local cleaned = {}
+    for k, v in pairs(data) do
+        if type(k) == "string" and k:sub(1, 1) ~= "_" and not InternalKeys[k] then cleaned[k] = v end
+    end
+    return cleaned
+end
+
+-- ConfigData (values loaded from disk, including elements not created yet)
+-- overlaid with the live value of every saveable element.
+function Claux:GetConfigSnapshot()
+    local data = CopyTable(self.ConfigData)
+    for key, el in pairs(self.Elements) do
+        if el._Save and el._Export then
+            local ok, v = pcall(el._Export, el)
+            if ok and v ~= nil then data[key] = v end
+        end
+    end
+    return data
+end
+
+function Claux:_Changed(el)
+    if not el.Flag then return end
+    self.Flags[el.Flag] = el:Get()
+    if el._Save and not Cfg.Applying then
+        self.ConfigData[el.Flag] = el:_Export()
+        self:QueueSave()
+    end
+end
+
+function Claux:QueueSave(force)
+    if not Cfg.AutoSave and not force then return end
+    if Cfg.Applying and not force then return end
+    if Cfg.SaveQueued then return end
+    Cfg.SaveQueued = true
+    task.delay(0.6, function()
+        Cfg.SaveQueued = false
+        self:SaveConfig(true)
+    end)
+end
+
+function Claux:SaveConfig(force)
+    if not HasFS or not Cfg.File then return false end
+    if Cfg.Applying and not force then return false end
+    return SafeWrite(Cfg.File, JSONEncode(BuildPayload()))
+end
+
+function Claux:LoadConfigFromFile()
+    local raw = SafeRead(Cfg.File)
+    if not raw then return false end
+    local payload = SafeJSONDecode(raw)
+    if type(payload) ~= "table" then return false end
+    local meta = payload._meta
+    if Cfg.VersionReset and type(meta) == "table" and meta.Version ~= nil and meta.Version ~= Cfg.Version then return false end
+    local data = ExtractData(payload)
+    if not data then return false end
+    for k, v in pairs(data) do self.ConfigData[k] = v end
+    if type(meta) == "table" and type(meta.ActiveConfig) == "string" then Cfg.ActiveName = meta.ActiveConfig end
+    return true
+end
+
+-- Apply a data table to the live elements (callbacks are fired so features update).
+function Claux:ApplyConfigData(data)
+    Cfg.Applying = true
+    for k, v in pairs(data) do self.ConfigData[k] = v end
+    -- Theme first, so a saved accent colour is applied on top of it.
+    local keys = {}
+    for key in pairs(data) do table.insert(keys, key) end
+    table.sort(keys, function(a, b)
+        local ta, tb = (a == "Claux_Theme"), (b == "Claux_Theme")
+        if ta ~= tb then return ta end
+        return tostring(a) < tostring(b)
+    end)
+    for _, key in ipairs(keys) do
+        local value = data[key]
+        local el = self.Elements[key]
+        if el and el._Import then
+            local ok, err = pcall(el._Import, el, value)
+            if ok then
+                if el._Fire then pcall(el._Fire, el) end
+            else
+                warn("[Claux] Gagal apply '" .. tostring(key) .. "': " .. tostring(err))
+            end
+        end
+    end
+    Cfg.Applying = false
+end
+
+local function ReadIndex()
+    local raw = SafeRead(Cfg.Dir .. "/_index.json")
+    local t = raw and SafeJSONDecode(raw)
+    return type(t) == "table" and t or {}
+end
+
+local function IndexAdd(name)
+    local list = ReadIndex()
+    if not table.find(list, name) then
+        table.insert(list, name)
+        SafeWrite(Cfg.Dir .. "/_index.json", JSONEncode(list))
+    end
+end
+
+local function IndexRemove(name)
+    local list = ReadIndex()
+    local idx = table.find(list, name)
+    if idx then
+        table.remove(list, idx)
+        SafeWrite(Cfg.Dir .. "/_index.json", JSONEncode(list))
+    end
+end
+
+function Claux:GetConfigs()
+    local set, list = {}, {}
+    if not HasFS or not Cfg.Dir then return list end
+    EnsureFolder(Cfg.Dir)
+    if type(listfiles) == "function" then
+        local ok, files = pcall(listfiles, Cfg.Dir)
+        if ok and type(files) == "table" then
+            for _, path in ipairs(files) do
+                local name = tostring(path):match("([^/\\]+)%.json$")
+                if name and name ~= "_index" then set[name] = true end
+            end
+        end
+    end
+    for _, name in ipairs(ReadIndex()) do
+        if type(name) == "string" and isfile(Cfg.Dir .. "/" .. name .. ".json") then set[name] = true end
+    end
+    for name in pairs(set) do table.insert(list, name) end
+    table.sort(list)
+    return list
+end
+
+function Claux:SaveConfigAs(name)
+    name = SanitizeName(name)
+    if name == "" then return false, "Nama config kosong." end
+    if not HasFS then return false, "Executor tidak mendukung file system." end
+    Cfg.ActiveName = name
+    local ok = SafeWrite(Cfg.Dir .. "/" .. name .. ".json", JSONEncode(BuildPayload()))
+    if not ok then return false, "Gagal menulis file." end
+    IndexAdd(name)
+    self:QueueSave(true)
+    return true
+end
+
+function Claux:LoadConfigByName(name)
+    name = SanitizeName(name)
+    if name == "" then return false, "Nama config kosong." end
+    local raw = SafeRead(Cfg.Dir .. "/" .. name .. ".json")
+    if not raw then return false, "Config tidak ditemukan." end
+    local data = ExtractData(SafeJSONDecode(raw))
+    if not data then return false, "Config rusak." end
+    self:ApplyConfigData(data)
+    Cfg.ActiveName = name
+    self:QueueSave(true)
+    return true
+end
+
+function Claux:DeleteConfig(name)
+    name = SanitizeName(name)
+    local path = Cfg.Dir .. "/" .. name .. ".json"
+    if name == "" or not HasFS or not isfile(path) then return false end
+    if type(delfile) == "function" then pcall(delfile, path) end
+    IndexRemove(name)
+    if self:GetAutoLoad() == name then self:SetAutoLoad("") end
+    if Cfg.ActiveName == name then Cfg.ActiveName = nil end
+    return true
+end
+
+function Claux:SetAutoLoad(name)
+    if not HasFS then return false end
+    return SafeWrite(Cfg.AutoloadFile, SanitizeName(name))
+end
+
+function Claux:GetAutoLoad()
+    local raw = SafeRead(Cfg.AutoloadFile)
+    return raw and Trim(raw) or ""
+end
+
+function Claux:ExportConfig()
+    return "CLAUX:" .. B64Encode(JSONEncode(BuildPayload()))
+end
+
+function Claux:ImportConfig(str)
+    str = Trim(str)
+    if str == "" then return false, "String kosong." end
+    local json = str
+    if str:sub(1, 6) == "CLAUX:" then json = B64Decode(str:sub(7)) end
+    local data = ExtractData(SafeJSONDecode(json))
+    if not data then return false, "Format config tidak valid." end
+    self:ApplyConfigData(data)
+    self:QueueSave(true)
+    return true
+end
+
+----------------------------------------------------------------------
+-- Element plumbing: locks, flags, registration
+----------------------------------------------------------------------
+local function AttachLock(frame, radius)
+    local overlay = New("Frame", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0.3, BackgroundColor3 = Color3.new(0, 0, 0),
+        Active = true, Visible = false, ZIndex = 20, Parent = frame,
+    })
+    Corner(overlay, radius or 6)
+    local label = New("TextLabel", { Size = UDim2.fromScale(1, 1), Text = "Locked", Font = FONT_MED, TextSize = 12, ZIndex = 21, Parent = overlay })
+    BindTheme(label, "TextColor3", "Text")
+    local api = {}
+    function api:Lock(text)
+        if text then label.Text = tostring(text) end
+        overlay.Visible = true
+    end
+    function api:Unlock() overlay.Visible = false end
+    return api
+end
+
+local function SyncFlag(el)
+    if el.Flag then Claux.Flags[el.Flag] = el:Get() end
+end
+
+-- Assign a unique flag, load the saved value (if any) and expose the element.
+local function RegisterElement(kind, cfg, el)
+    local title = cfg.Title or cfg.Name or kind
+    local base = cfg.Flag or (kind .. "_" .. tostring(title))
+    local key, n = base, 1
+    while Claux.Elements[key] do
+        n = n + 1
+        key = base .. "_" .. n
+    end
+    el.Flag = key
+    el._Save = cfg.Save ~= false
+    Claux.Elements[key] = el
+    if el._Save then
+        local saved = Claux.ConfigData[key]
+        if saved ~= nil and el._Import then pcall(el._Import, el, saved) end
+    end
+    SyncFlag(el)
+    return key
+end
+
+----------------------------------------------------------------------
+-- Row builder (every item lives in one of these cards)
+----------------------------------------------------------------------
+local function MakeRow(section, cfg, opts)
+    opts = opts or {}
+    local title = cfg.Title or cfg.Name or ""
+    local content = cfg.Content or cfg.Description or ""
+    local minH = opts.MinHeight or 34
+
+    local Frame = New("Frame", {
+        Size = UDim2.new(1, 0, 0, minH), AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 0, LayoutOrder = section:_NextOrder(), Parent = section.Body,
+    })
+    BindTheme(Frame, "BackgroundColor3", "Element")
+    Corner(Frame, 6)
+
+    local Inner = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = Frame })
+    List(Inner, 0)
+
+    local Head = New("Frame", { Size = UDim2.new(1, 0, 0, minH), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1, Parent = Inner })
+
+    local Left = New("Frame", { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 1, Parent = Head })
+    Pad(Left, 0, 0, 9, 9)
+    List(Left, 1)
+
+    local Title = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Text = title, Font = FONT_MED, TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Visible = title ~= "", LayoutOrder = 1, Parent = Left,
+    })
+    BindTheme(Title, "TextColor3", "Text")
+
+    local Content = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Text = content, TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+        Visible = content ~= "", LayoutOrder = 2, Parent = Left,
+    })
+    BindTheme(Content, "TextColor3", "SubText")
+
+    local Hit, Right
+    if not opts.NoInteract then
+        Hit = New("TextButton", { Size = UDim2.fromScale(1, 1), Text = "", ZIndex = 2, Parent = Head })
+        Hit.MouseEnter:Connect(function() Tween(Frame, { BackgroundColor3 = Claux.Theme.ElementHover }, 0.12) end)
+        Hit.MouseLeave:Connect(function() Tween(Frame, { BackgroundColor3 = Claux.Theme.Element }, 0.12) end)
+    end
+    if not opts.NoRight then
+        Right = New("Frame", {
+            AnchorPoint = Vector2.new(1, opts.RightTop and 0 or 0.5),
+            Position = opts.RightTop and UDim2.new(1, -8, 0, 7) or UDim2.new(1, -8, 0.5, 0),
+            Size = UDim2.fromOffset(0, 22), AutomaticSize = Enum.AutomaticSize.X, ZIndex = 3, Parent = Head,
+        })
+        List(Right, 6, Enum.FillDirection.Horizontal, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
+        local function Fit() Left.Size = UDim2.new(1, -(Right.AbsoluteSize.X + 28), 0, 0) end
+        Right:GetPropertyChangedSignal("AbsoluteSize"):Connect(Fit)
+        Fit()
+    end
+
+    return { Frame = Frame, Inner = Inner, Head = Head, Left = Left, Right = Right, Hit = Hit, Title = Title, Content = Content }
+end
+
+-- Shared methods for every row-based element + search registration.
+local function Decorate(section, El, R, cfg)
+    El.Frame = R.Frame
+    El.Row = R
+    El.Section = section
+    El.TitleText = cfg.Title or cfg.Name or ""
+
+    local lock = AttachLock(R.Frame, 6)
+    function El:Lock(text) lock:Lock(text) end
+    function El:Unlock() lock:Unlock() end
+    function El:SetVisible(v) R.Frame.Visible = v and true or false end
+    function El:SetTitle(t)
+        t = tostring(t or "")
+        R.Title.Text = t
+        R.Title.Visible = t ~= ""
+        self.TitleText = t
+    end
+    function El:SetContent(t)
+        t = tostring(t or "")
+        R.Content.Text = t
+        R.Content.Visible = t ~= ""
+    end
+
+    local entry = { Title = El.TitleText, Content = cfg.Content or cfg.Description or "", Tab = section.Tab, Section = section, Frame = R.Frame }
+    table.insert(section.Window.SearchRegistry, entry)
+
+    function El:Destroy()
+        local idx = table.find(section.Window.SearchRegistry, entry)
+        if idx then table.remove(section.Window.SearchRegistry, idx) end
+        if self.Flag then
+            Claux.Elements[self.Flag] = nil
+            Claux.Flags[self.Flag] = nil
+        end
+        local kb = table.find(Claux.Keybinds, self)
+        if kb then table.remove(Claux.Keybinds, kb) end
+        R.Frame:Destroy()
+    end
+end
+
+local function Finish(section, El, R, cfg, kind, opts)
+    opts = opts or {}
+    Decorate(section, El, R, cfg)
+    if not opts.NoRegister then RegisterElement(kind, cfg, El) end
+    if opts.Fire then
+        task.defer(function()
+            if El._Fire then El:_Fire() end
+        end)
+    end
+    return El
+end
+
+----------------------------------------------------------------------
+-- Keybind widget (standalone row or chip on a toggle row)
+----------------------------------------------------------------------
+local ModeCycle = { "Press", "Toggle", "Hold" }
+local KeyShort = {
+    LeftControl = "LCtrl", RightControl = "RCtrl", LeftShift = "LShift", RightShift = "RShift",
+    LeftAlt = "LAlt", RightAlt = "RAlt", Backspace = "Bksp", Return = "Enter", Insert = "Ins",
+    Delete = "Del", PageUp = "PgUp", PageDown = "PgDn", CapsLock = "Caps", Escape = "Esc", Backquote = "`",
+}
+
+local function KeyName(kc)
+    if not kc then return "None" end
+    return KeyShort[kc.Name] or kc.Name
+end
+
+local function ParseKey(v)
+    if typeof(v) == "EnumItem" then return v end
+    if type(v) == "string" and v ~= "" and v ~= "None" then
+        local ok, kc = pcall(function() return Enum.KeyCode[v] end)
+        if ok then return kc end
+    end
+    return nil
+end
+
+local function MakeKeybind(container, cfg, owner, layoutOrder)
+    local modes = cfg.Modes or (owner and { "Toggle", "Hold" } or ModeCycle)
+    local El = { Type = "Keybind", Key = ParseKey(cfg.Default), State = false, Hidden = cfg.HideInList == true }
+    El.Mode = cfg.Mode or modes[1]
+    if not table.find(modes, El.Mode) then El.Mode = modes[1] end
+    El.TitleText = cfg.Title or cfg.Name or (owner and ((owner.TitleText or "Toggle") .. " Key")) or "Keybind"
+    El.Owner = owner
+
+    local chip = New("TextButton", {
+        Size = UDim2.fromOffset(34, 20), AutomaticSize = Enum.AutomaticSize.X, Text = KeyName(El.Key),
+        Font = FONT_MED, TextSize = 11, BackgroundTransparency = 0, LayoutOrder = layoutOrder or 1, Parent = container,
+    })
+    BindTheme(chip, "BackgroundColor3", "Background")
+    BindTheme(chip, "TextColor3", "SubText")
+    Corner(chip, 5)
+    Stroke(chip, "Outline")
+    Pad(chip, 8, 8, 0, 0)
+    El.Chip = chip
+
+    local function Refresh()
+        chip.Text = (Claux.Listening == El) and "..." or KeyName(El.Key)
+        if Claux._RefreshKeybindList then Claux:_RefreshKeybindList() end
+    end
+    El._Refresh = Refresh
+
+    function El:Get() return { Key = self.Key, Mode = self.Mode, Active = owner and owner.Value or self.State } end
+
+    function El:SetKey(kc, silent)
+        self.Key = kc
+        Refresh()
+        SyncFlag(self)
+        Fire(cfg.OnChanged, kc)
+        if not silent then Claux:_Changed(self) end
+    end
+    function El:Set(v, silent) self:SetKey(ParseKey(v), silent) end
+
+    function El:SetMode(m, silent)
+        if not table.find(modes, m) then return end
+        self.Mode = m
+        Refresh()
+        SyncFlag(self)
+        if not silent then Claux:_Changed(self) end
+    end
+
+    function El:_Fire() end
+    function El:_Export() return { Key = self.Key and self.Key.Name or "", Mode = self.Mode } end
+    function El:_Import(v)
+        if type(v) == "table" then
+            if v.Mode then self:SetMode(v.Mode, true) end
+            self:SetKey(ParseKey(v.Key), true)
+        elseif type(v) == "string" then
+            self:SetKey(ParseKey(v), true)
+        end
+    end
+
+    local function Trigger(state)
+        El.State = state
+        if owner then owner:Set(state) end
+        Fire(cfg.Callback, state)
+        Refresh()
+    end
+
+    function El:_Press(code)
+        if not self.Key or code ~= self.Key then return end
+        if self.Mode == "Hold" then
+            Trigger(true)
+        elseif self.Mode == "Toggle" then
+            if owner then Trigger(not owner.Value) else Trigger(not self.State) end
+        else
+            if owner then
+                Trigger(not owner.Value)
+            else
+                Fire(cfg.Callback, self.Key)
+                Tween(chip, { BackgroundColor3 = Claux.Theme.Accent }, 0.08)
+                task.delay(0.12, function()
+                    if chip.Parent then Tween(chip, { BackgroundColor3 = Claux.Theme.Background }, 0.2) end
+                end)
+            end
+        end
+    end
+
+    function El:_Release(code)
+        if self.Mode == "Hold" and self.Key and code == self.Key then Trigger(false) end
+    end
+
+    function El:BeginListen()
+        local prev = Claux.Listening
+        if prev == El then
+            Claux.Listening = nil
+        else
+            Claux.Listening = El
+        end
+        if prev and prev._Refresh then prev._Refresh() end
+        Refresh()
+    end
+
+    chip.Activated:Connect(function() El:BeginListen() end)
+    chip.MouseButton2Click:Connect(function()
+        if #modes <= 1 then return end
+        local i = table.find(modes, El.Mode) or 1
+        El:SetMode(modes[(i % #modes) + 1])
+        Claux:Notify({ Title = El.TitleText, Content = "Mode: " .. El.Mode, Duration = 1.5 })
+    end)
+
+    table.insert(Claux.Keybinds, El)
+    return El
+end
+
+----------------------------------------------------------------------
+-- Colour picker widget (SV square + hue bar + optional alpha + hex)
+----------------------------------------------------------------------
+local function ColorToHex(c)
+    return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+local function HexToColor(s)
+    s = tostring(s or ""):gsub("#", ""):gsub("%s", "")
+    if #s == 3 then s = s:sub(1, 1):rep(2) .. s:sub(2, 2):rep(2) .. s:sub(3, 3):rep(2) end
+    if #s ~= 6 then return nil end
+    local r, g, b = tonumber(s:sub(1, 2), 16), tonumber(s:sub(3, 4), 16), tonumber(s:sub(5, 6), 16)
+    if r and g and b then return RGB(r, g, b) end
+    return nil
+end
+
+local function MakeColorPicker(container, cfg, layoutOrder)
+    local useAlpha = cfg.Alpha ~= nil or cfg.AllowAlpha == true
+    local start = cfg.Default or cfg.Color or RGB(255, 255, 255)
+    local El = { Type = "ColorPicker", Value = start, Alpha = cfg.Alpha or 1 }
+    local h, s, v = start:ToHSV()
+
+    local chip = New("TextButton", {
+        Size = UDim2.fromOffset(30, 16), Text = "", BackgroundTransparency = 0, BackgroundColor3 = start,
+        LayoutOrder = layoutOrder or 5, Parent = container,
+    })
+    Corner(chip, 4)
+    Stroke(chip, "Outline")
+    El.Chip = chip
+
+    local Pop, SV, SVCursor, HueCursor, AlphaBar, AlphaCursor, Hex
+
+    local function Visual()
+        if not Pop then return end
+        SV.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+        SVCursor.Position = UDim2.fromScale(s, 1 - v)
+        HueCursor.Position = UDim2.fromScale(h, 0.5)
+        if AlphaBar then
+            AlphaBar.BackgroundColor3 = El.Value
+            AlphaCursor.Position = UDim2.fromScale(El.Alpha, 0.5)
+        end
+        Hex.Text = ColorToHex(El.Value)
+    end
+
+    local function Apply(silent)
+        El.Value = Color3.fromHSV(h, s, v)
+        chip.BackgroundColor3 = El.Value
+        Visual()
+        SyncFlag(El)
+        if not silent then
+            Claux:_Changed(El)
+            El:_Fire()
+        end
+    end
+
+    local function Build()
+        Pop = New("Frame", { Visible = false, BackgroundTransparency = 0, ZIndex = 2, Parent = Claux.PopupLayer })
+        BindTheme(Pop, "BackgroundColor3", "Background")
+        Corner(Pop, 8)
+        Stroke(Pop, "Outline")
+
+        SV = New("TextButton", { Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 0, 100), Text = "", BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 0, 0), Parent = Pop })
+        Corner(SV, 4)
+        local white = New("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = SV })
+        Corner(white, 4)
+        New("UIGradient", { Transparency = NumberSequence.new(0, 1), Parent = white })
+        local black = New("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(0, 0, 0), Parent = SV })
+        Corner(black, 4)
+        New("UIGradient", { Rotation = 90, Transparency = NumberSequence.new(1, 0), Parent = black })
+        SVCursor = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(9, 9), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = SV })
+        Corner(SVCursor, 5)
+        New("UIStroke", { Thickness = 1.5, Color = Color3.new(0, 0, 0), Parent = SVCursor })
+
+        local hueBar = New("TextButton", { Position = UDim2.fromOffset(8, 116), Size = UDim2.new(1, -16, 0, 10), Text = "", BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = Pop })
+        Corner(hueBar, 5)
+        local kps = {}
+        for i = 0, 6 do
+            table.insert(kps, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1)))
+        end
+        New("UIGradient", { Color = ColorSequence.new(kps), Parent = hueBar })
+        HueCursor = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(4, 14), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = hueBar })
+        Corner(HueCursor, 2)
+        New("UIStroke", { Thickness = 1, Color = Color3.new(0, 0, 0), Parent = HueCursor })
+
+        local hexY = 132
+        if useAlpha then
+            AlphaBar = New("TextButton", { Position = UDim2.fromOffset(8, 132), Size = UDim2.new(1, -16, 0, 10), Text = "", BackgroundTransparency = 0, BackgroundColor3 = El.Value, Parent = Pop })
+            Corner(AlphaBar, 5)
+            New("UIGradient", { Transparency = NumberSequence.new(1, 0), Parent = AlphaBar })
+            New("UIStroke", { Thickness = 1, Color = Claux.Theme.Outline, Parent = AlphaBar })
+            AlphaCursor = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(4, 14), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = AlphaBar })
+            Corner(AlphaCursor, 2)
+            New("UIStroke", { Thickness = 1, Color = Color3.new(0, 0, 0), Parent = AlphaCursor })
+            hexY = 148
+            Draggable(AlphaBar, function(pos)
+                El.Alpha = Clamp((pos.X - AlphaBar.AbsolutePosition.X) / math.max(AlphaBar.AbsoluteSize.X, 1), 0, 1)
+                Apply()
+            end)
+        end
+
+        Hex = New("TextBox", { Position = UDim2.fromOffset(8, hexY), Size = UDim2.new(1, -16, 0, 22), Text = "", ClearTextOnFocus = false, TextSize = 11, Font = FONT_MED, BackgroundTransparency = 0, Parent = Pop })
+        BindTheme(Hex, "BackgroundColor3", "Element")
+        BindTheme(Hex, "TextColor3", "Text")
+        Corner(Hex, 5)
+        Hex.FocusLost:Connect(function()
+            local c = HexToColor(Hex.Text)
+            if c then
+                h, s, v = c:ToHSV()
+                Apply()
+            else
+                Visual()
+            end
+        end)
+
+        Draggable(SV, function(pos)
+            s = Clamp((pos.X - SV.AbsolutePosition.X) / math.max(SV.AbsoluteSize.X, 1), 0, 1)
+            v = 1 - Clamp((pos.Y - SV.AbsolutePosition.Y) / math.max(SV.AbsoluteSize.Y, 1), 0, 1)
+            Apply()
+        end)
+        Draggable(hueBar, function(pos)
+            h = Clamp((pos.X - hueBar.AbsolutePosition.X) / math.max(hueBar.AbsoluteSize.X, 1), 0, 0.999)
+            Apply()
+        end)
+        El._PopHeight = hexY + 22 + 8
+    end
+
+    function El:Open()
+        if not Pop then Build() end
+        Visual()
+        Claux:_OpenPopup(chip, Pop, 200, El._PopHeight)
+    end
+    chip.Activated:Connect(function() El:Open() end)
+
+    function El:Get() return self.Value end
+    function El:Set(color, alpha, silent)
+        if type(alpha) == "boolean" then
+            silent = alpha
+            alpha = nil
+        end
+        if typeof(color) == "Color3" then h, s, v = color:ToHSV() end
+        if type(alpha) == "number" then self.Alpha = Clamp(alpha, 0, 1) end
+        Apply(silent)
+    end
+    function El:_Fire() Fire(cfg.Callback, self.Value, self.Alpha) end
+    function El:_Export() return { Hex = ColorToHex(self.Value), A = self.Alpha } end
+    function El:_Import(t)
+        local c, a
+        if type(t) == "table" then
+            c = HexToColor(t.Hex)
+            a = t.A
+        elseif type(t) == "string" then
+            c = HexToColor(t)
+        end
+        if c then self:Set(c, a, true) end
+    end
+
+    return El
+end
+
+----------------------------------------------------------------------
+-- Section items
+----------------------------------------------------------------------
+function SectionMethods:AddButton(cfg)
+    if type(cfg) == "string" then cfg = { Title = cfg } end
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local btn = New("TextButton", {
+        Size = UDim2.fromOffset(cfg.Width or 76, 22), Text = cfg.Text or cfg.ButtonName or "Click",
+        Font = FONT_MED, TextSize = 12, BackgroundTransparency = 0, Parent = R.Right,
+    })
+    BindTheme(btn, "BackgroundColor3", "Background")
+    BindTheme(btn, "TextColor3", "Text")
+    Corner(btn, 5)
+    Stroke(btn, "Outline")
+
+    local El = { Type = "Button" }
+    function El:Press()
+        Tween(btn, { BackgroundColor3 = Claux.Theme.Accent }, 0.08)
+        task.delay(0.12, function()
+            if btn.Parent then Tween(btn, { BackgroundColor3 = Claux.Theme.Background }, 0.2) end
+        end)
+        Fire(cfg.Callback)
+    end
+    function El:SetText(t) btn.Text = tostring(t) end
+    btn.Activated:Connect(function() El:Press() end)
+    R.Hit.Activated:Connect(function() El:Press() end)
+    return Finish(self, El, R, cfg, "Button", { NoRegister = true })
+end
+
+function SectionMethods:AddToggle(cfg)
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local track = New("TextButton", {
+        Size = UDim2.fromOffset(34, 18), Text = "", BackgroundTransparency = 0,
+        BackgroundColor3 = Color3.new(1, 1, 1), LayoutOrder = 10, Parent = R.Right,
+    })
+    Corner(track, 9)
+    local grad = New("UIGradient", { Parent = track })
+    local knob = New("Frame", { Size = UDim2.fromOffset(12, 12), Position = UDim2.fromOffset(3, 3), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = track })
+    Corner(knob, 6)
+
+    local El = { Type = "Toggle", Value = cfg.Default == true }
+    local function Paint()
+        local t = Claux.Theme
+        if El.Value then
+            grad.Color = ColorSequence.new(t.Accent, t.AccentLight)
+        else
+            grad.Color = ColorSequence.new(t.ToggleOff, t.ToggleOff)
+        end
+        Tween(knob, { Position = El.Value and UDim2.fromOffset(19, 3) or UDim2.fromOffset(3, 3) }, 0.12)
+    end
+    OnTheme(track, function() Paint() end)
+
+    function El:Get() return self.Value end
+    function El:Set(v, silent)
+        v = v and true or false
+        local changed = v ~= self.Value
+        self.Value = v
+        Paint()
+        SyncFlag(self)
+        if not silent and changed then
+            Claux:_Changed(self)
+            self:_Fire()
+        end
+    end
+    function El:_Fire() Fire(cfg.Callback, self.Value) end
+    function El:_Export() return self.Value end
+    function El:_Import(v) self:Set(v == true or v == 1, true) end
+
+    track.Activated:Connect(function() El:Set(not El.Value) end)
+    R.Hit.Activated:Connect(function() El:Set(not El.Value) end)
+
+    -- Inline widgets on the same row (Neverlose style)
+    function El:AddKeybind(kcfg)
+        kcfg = kcfg or {}
+        local kb = MakeKeybind(R.Right, kcfg, El, 1)
+        RegisterElement("Keybind", { Title = kb.TitleText, Flag = kcfg.Flag, Save = kcfg.Save }, kb)
+        return kb
+    end
+    function El:AddColorPicker(ccfg)
+        ccfg = ccfg or {}
+        local cp = MakeColorPicker(R.Right, ccfg, 2)
+        RegisterElement("ColorPicker", { Title = ccfg.Title or ((El.TitleText or "Toggle") .. " Color"), Flag = ccfg.Flag, Save = ccfg.Save }, cp)
+        task.defer(function() cp:_Fire() end)
+        return cp
+    end
+
+    return Finish(self, El, R, cfg, "Toggle", { Fire = true })
+end
+
+function SectionMethods:AddSlider(cfg)
+    cfg = cfg or {}
+    local min, max = cfg.Min or 0, cfg.Max or 100
+    local inc = cfg.Increment or (cfg.Decimals and (10 ^ -cfg.Decimals)) or 1
+    local suffix = cfg.Suffix or ""
+
+    local function Snap(val)
+        val = Clamp(val, min, max)
+        if inc > 0 then val = math.floor((val - min) / inc + 0.5) * inc + min end
+        local dec = tostring(inc):match("%.(%d+)")
+        val = tonumber(string.format("%." .. (dec and #dec or 0) .. "f", val)) or val
+        return Clamp(val, min, max)
+    end
+
+    local R = MakeRow(self, cfg, { RightTop = true })
+    local box = New("TextBox", {
+        Size = UDim2.fromOffset(58, 20), Text = "", ClearTextOnFocus = false, TextSize = 11, Font = FONT_MED,
+        BackgroundTransparency = 0, Parent = R.Right,
+    })
+    BindTheme(box, "BackgroundColor3", "Background")
+    BindTheme(box, "TextColor3", "Text")
+    Corner(box, 4)
+    Stroke(box, "Outline")
+
+    local Extra = New("TextButton", { Size = UDim2.new(1, 0, 0, 18), Text = "", LayoutOrder = 2, Parent = R.Inner })
+    local Bar = New("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.new(1, -20, 0, 4), BackgroundTransparency = 0, Parent = Extra })
+    BindTheme(Bar, "BackgroundColor3", "ToggleOff")
+    Corner(Bar, 2)
+    local Fill = New("Frame", { Size = UDim2.fromScale(0, 1), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = Bar })
+    Corner(Fill, 2)
+    AccentGradient(Fill, 0)
+    local Knob = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(10, 10), Position = UDim2.fromScale(0, 0.5), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = Bar })
+    Corner(Knob, 5)
+
+    local El = { Type = "Slider", Value = Snap(tonumber(cfg.Default) or min) }
+    local function Paint()
+        local a = (max == min) and 0 or (El.Value - min) / (max - min)
+        Fill.Size = UDim2.fromScale(a, 1)
+        Knob.Position = UDim2.fromScale(a, 0.5)
+        box.Text = tostring(El.Value) .. suffix
+    end
+
+    function El:Get() return self.Value end
+    function El:Set(val, silent)
+        val = tonumber(val)
+        if not val then return end
+        val = Snap(val)
+        local changed = val ~= self.Value
+        self.Value = val
+        Paint()
+        SyncFlag(self)
+        if not silent and changed then
+            Claux:_Changed(self)
+            self:_Fire()
+        end
+    end
+    function El:_Fire() Fire(cfg.Callback, self.Value) end
+    function El:_Export() return self.Value end
+    function El:_Import(val) self:Set(val, true) end
+
+    Draggable(Extra, function(pos)
+        local a = Clamp((pos.X - Bar.AbsolutePosition.X) / math.max(Bar.AbsoluteSize.X, 1), 0, 1)
+        El:Set(min + (max - min) * a)
+    end, self.Tab.Page)
+
+    box.Focused:Connect(function() box.Text = tostring(El.Value) end)
+    box.FocusLost:Connect(function()
+        local n = tonumber((box.Text:gsub("[^%d%.%-]", "")))
+        if n then El:Set(n) end
+        Paint()
+    end)
+
+    Paint()
+    return Finish(self, El, R, cfg, "Slider", { Fire = true })
+end
+
+function SectionMethods:AddDropdown(cfg)
+    cfg = cfg or {}
+    local multi = cfg.Multi == true
+    local El = { Type = "Dropdown", Multi = multi, Options = {}, Selected = {}, Value = nil }
+    for _, o in ipairs(cfg.Options or cfg.Values or {}) do table.insert(El.Options, o) end
+
+    if multi then
+        local d = cfg.Default
+        if type(d) == "table" then
+            for _, o in ipairs(d) do El.Selected[o] = true end
+        elseif d ~= nil then
+            El.Selected[d] = true
+        end
+    else
+        El.Value = cfg.Default
+    end
+
+    local R = MakeRow(self, cfg)
+    local chip = New("TextButton", { Size = UDim2.fromOffset(cfg.Width or 130, 22), Text = "", BackgroundTransparency = 0, Parent = R.Right })
+    BindTheme(chip, "BackgroundColor3", "Background")
+    Corner(chip, 5)
+    Stroke(chip, "Outline")
+    local chipText = New("TextLabel", {
+        Size = UDim2.new(1, -26, 1, 0), Position = UDim2.fromOffset(8, 0), TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = chip,
+    })
+    BindTheme(chipText, "TextColor3", "Text")
+    local arrow = MakeIcon(chip, "chevron-down", 12, "SubText", "v")
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -6, 0.5, 0)
+
+    local function IsSel(o)
+        if multi then return El.Selected[o] == true end
+        return El.Value == o
+    end
+
+    local function CurrentList()
+        local list = {}
+        for _, o in ipairs(El.Options) do
+            if El.Selected[o] then list[#list + 1] = o end
+        end
+        for o in pairs(El.Selected) do
+            if not table.find(El.Options, o) then list[#list + 1] = o end
+        end
+        return list
+    end
+
+    local Pop, Search, ListFrame
+    local Btns, Paints = {}, {}
+    local Rebuild
+
+    function El:_Refresh()
+        if multi then
+            local l = CurrentList()
+            if #l == 0 then
+                chipText.Text = "None"
+            else
+                local parts = {}
+                for i, o in ipairs(l) do parts[i] = tostring(o) end
+                chipText.Text = table.concat(parts, ", ")
+            end
+        else
+            chipText.Text = (self.Value ~= nil) and tostring(self.Value) or "None"
+        end
+        for _, p in ipairs(Paints) do p() end
+        SyncFlag(self)
+    end
+
+    function El:Get()
+        if multi then return CurrentList() end
+        return self.Value
+    end
+
+    function El:Set(v, silent)
+        if multi then
+            self.Selected = {}
+            if type(v) == "table" then
+                for _, o in ipairs(v) do self.Selected[o] = true end
+            elseif v ~= nil then
+                self.Selected[v] = true
+            end
+        else
+            self.Value = v
+        end
+        self:_Refresh()
+        if not silent then
+            Claux:_Changed(self)
+            self:_Fire()
+        end
+    end
+
+    function El:_Fire() Fire(cfg.Callback, self:Get()) end
+    function El:_Export() return self:Get() end
+    function El:_Import(v) self:Set(v, true) end
+
+    function El:Refresh(list, default)
+        self.Options = {}
+        for _, o in ipairs(list or {}) do table.insert(self.Options, o) end
+        if default ~= nil then
+            self:Set(default, true)
+        elseif multi then
+            for o in pairs(self.Selected) do
+                if not table.find(self.Options, o) then self.Selected[o] = nil end
+            end
+        elseif self.Value ~= nil and not table.find(self.Options, self.Value) then
+            self.Value = nil
+        end
+        self:_Refresh()
+        if Pop then Rebuild() end
+    end
+    El.SetValues = El.Refresh
+    function El:AddOption(o)
+        if not table.find(self.Options, o) then
+            table.insert(self.Options, o)
+            self:_Refresh()
+            if Pop then Rebuild() end
+        end
+    end
+    function El:RemoveOption(o)
+        local i = table.find(self.Options, o)
+        if i then
+            table.remove(self.Options, i)
+            if multi then self.Selected[o] = nil elseif self.Value == o then self.Value = nil end
+            self:_Refresh()
+            if Pop then Rebuild() end
+        end
+    end
+    function El:Clear() self:Refresh({}) end
+
+    Rebuild = function()
+        for _, b in ipairs(Btns) do b:Destroy() end
+        Btns, Paints = {}, {}
+        if not ListFrame then return end
+        local q = string.lower(Search.Text or "")
+        for i, o in ipairs(El.Options) do
+            local txt = tostring(o)
+            if q == "" or string.find(string.lower(txt), q, 1, true) then
+                local b = New("TextButton", { Size = UDim2.new(1, 0, 0, 24), Text = "", LayoutOrder = i, Parent = ListFrame })
+                Corner(b, 5)
+                local l = New("TextLabel", {
+                    Size = UDim2.new(1, -24, 1, 0), Position = UDim2.fromOffset(8, 0), Text = txt, Font = FONT_MED, TextSize = 12,
+                    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = b,
+                })
+                local mark = New("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(6, 6), BackgroundTransparency = 0, Parent = b })
+                Corner(mark, 3)
+                local function paint()
+                    local sel = IsSel(o)
+                    l.TextColor3 = sel and Claux.Theme.Accent or Claux.Theme.Text
+                    mark.BackgroundColor3 = Claux.Theme.Accent
+                    mark.Visible = sel
+                end
+                paint()
+                Paints[#Paints + 1] = paint
+                b.MouseEnter:Connect(function()
+                    b.BackgroundColor3 = Claux.Theme.Element
+                    b.BackgroundTransparency = 0
+                end)
+                b.MouseLeave:Connect(function() b.BackgroundTransparency = 1 end)
+                b.Activated:Connect(function()
+                    if multi then
+                        El.Selected[o] = (not El.Selected[o]) or nil
+                        El:_Refresh()
+                        Claux:_Changed(El)
+                        El:_Fire()
+                    else
+                        El:Set(o)
+                        Claux:_ClosePopup()
+                    end
+                end)
+                Btns[#Btns + 1] = b
+            end
+        end
+    end
+
+    local function BuildPop()
+        Pop = New("Frame", { Visible = false, BackgroundTransparency = 0, ZIndex = 2, Parent = Claux.PopupLayer })
+        BindTheme(Pop, "BackgroundColor3", "Background")
+        Corner(Pop, 6)
+        Stroke(Pop, "Outline")
+        Search = New("TextBox", {
+            Position = UDim2.fromOffset(6, 6), Size = UDim2.new(1, -12, 0, 24), Text = "", PlaceholderText = "Search...",
+            ClearTextOnFocus = false, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 0, Parent = Pop,
+        })
+        BindTheme(Search, "BackgroundColor3", "Element")
+        BindTheme(Search, "TextColor3", "Text")
+        BindTheme(Search, "PlaceholderColor3", "SubText")
+        Corner(Search, 5)
+        Pad(Search, 8, 8, 0, 0)
+        ListFrame = New("ScrollingFrame", {
+            Position = UDim2.fromOffset(4, 4), Size = UDim2.new(1, -8, 1, -8), CanvasSize = UDim2.new(),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2, Parent = Pop,
+        })
+        BindTheme(ListFrame, "ScrollBarImageColor3", "Accent")
+        List(ListFrame, 1)
+        Search:GetPropertyChangedSignal("Text"):Connect(function() Rebuild() end)
+    end
+
+    local function Open()
+        if not Pop then BuildPop() end
+        local useSearch = cfg.Search == true or (cfg.Search ~= false and #El.Options > 8)
+        Search.Visible = useSearch
+        ListFrame.Position = useSearch and UDim2.fromOffset(4, 34) or UDim2.fromOffset(4, 4)
+        ListFrame.Size = useSearch and UDim2.new(1, -8, 1, -38) or UDim2.new(1, -8, 1, -8)
+        Search.Text = ""
+        Rebuild()
+        local h = math.max(40, math.min(#El.Options * 25 + 8 + (useSearch and 30 or 0), 230))
+        Claux:_OpenPopup(chip, Pop, math.max(chip.AbsoluteSize.X, 150), h)
+    end
+    chip.Activated:Connect(Open)
+    R.Hit.Activated:Connect(Open)
+
+    El:_Refresh()
+    return Finish(self, El, R, cfg, "Dropdown", { Fire = true })
+end
+
+function SectionMethods:AddInput(cfg)
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local box = New("TextBox", {
+        Size = UDim2.fromOffset(cfg.Width or 130, 22), Text = tostring(cfg.Default or ""), PlaceholderText = cfg.Placeholder or "Type here...",
+        ClearTextOnFocus = false, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 0, Parent = R.Right,
+    })
+    BindTheme(box, "BackgroundColor3", "Background")
+    BindTheme(box, "TextColor3", "Text")
+    BindTheme(box, "PlaceholderColor3", "SubText")
+    Corner(box, 5)
+    local st = Stroke(box, "Outline")
+    Pad(box, 8, 8, 0, 0)
+
+    local El = { Type = "Input", Value = box.Text }
+    function El:Get() return self.Value end
+    function El:Set(val, silent)
+        self._setting = true
+        box.Text = tostring(val or "")
+        self._setting = false
+        self.Value = box.Text
+        SyncFlag(self)
+        if not silent then
+            Claux:_Changed(self)
+            self:_Fire()
+        end
+    end
+    function El:_Fire() Fire(cfg.Callback, cfg.Numeric and tonumber(self.Value) or self.Value) end
+    function El:_Export() return self.Value end
+    function El:_Import(val) self:Set(val, true) end
+
+    box:GetPropertyChangedSignal("Text"):Connect(function()
+        if El._setting then return end
+        if cfg.Numeric then
+            local f = box.Text:gsub("[^%d%.%-]", "")
+            if f ~= box.Text then
+                box.Text = f
+                return
+            end
+        end
+        El.Value = box.Text
+        SyncFlag(El)
+        if cfg.Finished == false then
+            Claux:_Changed(El)
+            El:_Fire()
+        end
+    end)
+    box.Focused:Connect(function() Tween(st, { Color = Claux.Theme.Accent }, 0.12) end)
+    box.FocusLost:Connect(function()
+        Tween(st, { Color = Claux.Theme.Outline }, 0.12)
+        if cfg.Finished ~= false then
+            Claux:_Changed(El)
+            El:_Fire()
+        end
+    end)
+    R.Hit.Activated:Connect(function() box:CaptureFocus() end)
+
+    return Finish(self, El, R, cfg, "Input", { Fire = cfg.FireOnInit == true })
+end
+
+function SectionMethods:AddKeybind(cfg)
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local El = MakeKeybind(R.Right, cfg, nil, 1)
+    R.Hit.Activated:Connect(function() El:BeginListen() end)
+    return Finish(self, El, R, cfg, "Keybind")
+end
+
+function SectionMethods:AddColorPicker(cfg)
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local El = MakeColorPicker(R.Right, cfg, 1)
+    R.Hit.Activated:Connect(function() El:Open() end)
+    return Finish(self, El, R, cfg, "ColorPicker", { Fire = true })
+end
+
+function SectionMethods:AddParagraph(cfg)
+    if type(cfg) == "string" then cfg = { Content = cfg } end
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg, { NoRight = true, NoInteract = true })
+    return Finish(self, { Type = "Paragraph" }, R, cfg, "Paragraph", { NoRegister = true })
+end
+
+function SectionMethods:AddLabel(cfg)
+    if type(cfg) == "string" then cfg = { Title = cfg } end
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg, { NoRight = true, NoInteract = true, MinHeight = 28 })
+    local El = { Type = "Label" }
+    function El:SetText(t) self:SetTitle(t) end
+    return Finish(self, El, R, cfg, "Label", { NoRegister = true })
+end
+
+function SectionMethods:AddDivider()
+    local f = New("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundTransparency = 0, LayoutOrder = self:_NextOrder(), Parent = self.Body })
+    BindTheme(f, "BackgroundColor3", "Outline")
+    return { Frame = f, Destroy = function() f:Destroy() end }
+end
+
+function SectionMethods:AddSpace(height)
+    local f = New("Frame", { Size = UDim2.new(1, 0, 0, height or 6), LayoutOrder = self:_NextOrder(), Parent = self.Body })
+    return { Frame = f, Destroy = function() f:Destroy() end }
+end
+
+function SectionMethods:AddSubSection(title)
+    if type(title) == "table" then title = title.Title or title.Name end
+    local l = New("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 20), Text = string.upper(tostring(title or "")), Font = FONT_BOLD, TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = self:_NextOrder(), Parent = self.Body,
+    })
+    BindTheme(l, "TextColor3", "SubText")
+    Pad(l, 4, 0, 4, 0)
+    return { Frame = l, SetTitle = function(_, t) l.Text = string.upper(tostring(t)) end, Destroy = function() l:Destroy() end }
+end
+
+-- Chloex "Panel": one row with an input box and a button (callback receives the text)
+function SectionMethods:AddPanel(cfg)
+    cfg = cfg or {}
+    local R = MakeRow(self, cfg)
+    local box = New("TextBox", {
+        Size = UDim2.fromOffset(cfg.Width or 110, 22), Text = tostring(cfg.Default or ""), PlaceholderText = cfg.Placeholder or "...",
+        ClearTextOnFocus = false, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 0, LayoutOrder = 1, Parent = R.Right,
+    })
+    BindTheme(box, "BackgroundColor3", "Background")
+    BindTheme(box, "TextColor3", "Text")
+    BindTheme(box, "PlaceholderColor3", "SubText")
+    Corner(box, 5)
+    Stroke(box, "Outline")
+    Pad(box, 8, 8, 0, 0)
+
+    local btn = New("TextButton", { Size = UDim2.fromOffset(cfg.ButtonWidth or 60, 22), Text = cfg.ButtonText or cfg.Text or "Apply", Font = FONT_MED, TextSize = 12, BackgroundTransparency = 0, LayoutOrder = 2, Parent = R.Right })
+    btn.BackgroundColor3 = Color3.new(1, 1, 1)
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    Corner(btn, 5)
+    AccentGradient(btn, 0)
+
+    local El = { Type = "Panel" }
+    function El:GetInput() return box.Text end
+    function El:SetInput(t) box.Text = tostring(t or "") end
+    local function Press()
+        Fire(cfg.Callback, box.Text)
+        if cfg.ClearOnPress then box.Text = "" end
+    end
+    btn.Activated:Connect(Press)
+    box.FocusLost:Connect(function(enter) if enter and cfg.EnterToSubmit then Press() end end)
+    return Finish(self, El, R, cfg, "Panel", { NoRegister = true })
+end
+
+----------------------------------------------------------------------
+-- Sections
+----------------------------------------------------------------------
+function SectionMethods:_NextOrder()
+    self.Order = (self.Order or 0) + 1
+    return self.Order
+end
+
+function SectionMethods:SetOpen(open)
+    if self.AlwaysOpen then open = true end
+    self.Open = open and true or false
+    self.Body.Visible = self.Open
+    self.HeaderFill.Visible = self.Open
+    Tween(self.Chevron, { Rotation = self.Open and 90 or 0 }, 0.15)
+end
+
+function SectionMethods:SetTitle(t)
+    self.Title = tostring(t or "")
+    self.TitleLabel.Text = self.Title
+end
+
+function SectionMethods:Lock(text) self._lock:Lock(text) end
+function SectionMethods:Unlock() self._lock:Unlock() end
+function SectionMethods:SetVisible(v) self.Card.Visible = v and true or false end
+
+function TabMethods:AddSection(title, alwaysOpen)
+    local opts = {}
+    if type(title) == "table" then
+        opts = title
+        title = opts.Title or opts.Name
+        alwaysOpen = opts.AlwaysOpen
+    end
+
+    local Sec = setmetatable({
+        Tab = self, Window = self.Window, Title = tostring(title or "Section"),
+        AlwaysOpen = alwaysOpen == true, Open = opts.Open ~= false, Order = 0,
+    }, SectionMethods)
+
+    self.SectionCount = (self.SectionCount or 0) + 1
+    local Card = New("Frame", {
+        Size = UDim2.new(1, 0, 0, 30), AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 0, LayoutOrder = self.SectionCount, Parent = self.Page,
+    })
+    BindTheme(Card, "BackgroundColor3", "Section")
+    Corner(Card, 8)
+    Stroke(Card, "Outline")
+
+    local Inner = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = Card })
+    List(Inner, 0)
+
+    local Header = New("TextButton", { Size = UDim2.new(1, 0, 0, 30), Text = "", BackgroundTransparency = 0, LayoutOrder = 1, Parent = Inner })
+    BindTheme(Header, "BackgroundColor3", "SectionTop")
+    Corner(Header, 8)
+    local Fill = New("Frame", { Size = UDim2.new(1, 0, 0, 8), Position = UDim2.new(0, 0, 1, -8), BackgroundTransparency = 0, Parent = Header })
+    BindTheme(Fill, "BackgroundColor3", "SectionTop")
+
+    local Dot = New("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(3, 12), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = Header })
+    Corner(Dot, 2)
+    AccentGradient(Dot, 90)
+
+    local TitleLabel = New("TextLabel", {
+        Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -50, 1, 0), Text = Sec.Title, Font = FONT_BOLD, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = Header,
+    })
+    BindTheme(TitleLabel, "TextColor3", "Text")
+
+    local Chevron = New("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(12, 12),
+        Text = ">", Font = FONT_BOLD, TextSize = 12, Visible = not Sec.AlwaysOpen, Parent = Header,
+    })
+    BindTheme(Chevron, "TextColor3", "SubText")
+
+    local Body = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2, Parent = Inner })
+    Pad(Body, 8, 8, 8, 8)
+    List(Body, 5)
+
+    Sec.Card, Sec.Body, Sec.HeaderFill, Sec.Chevron, Sec.TitleLabel = Card, Body, Fill, Chevron, TitleLabel
+    Sec._lock = AttachLock(Card, 8)
+
+    Header.Activated:Connect(function()
+        if not Sec.AlwaysOpen then Sec:SetOpen(not Sec.Open) end
+    end)
+
+    Sec:SetOpen(Sec.Open)
+    Chevron.Rotation = Sec.Open and 90 or 0
+    return Sec
+end
+
+----------------------------------------------------------------------
+-- Search helpers
+----------------------------------------------------------------------
+local function SmartMatch(query, text)
+    query = string.lower(query or "")
+    text = string.lower(text or "")
+    if query == "" or text == "" then return 0 end
+    if text == query then return 1000 end
+    local s = string.find(text, query, 1, true)
+    if s then return 800 - s end
+    if #query < 2 then return 0 end
+    local qi, score, last = 1, 0, 0
+    for i = 1, #text do
+        if text:sub(i, i) == query:sub(qi, qi) then
+            score = score + ((i == last + 1) and 5 or 1)
+            last = i
+            qi = qi + 1
+            if qi > #query then return 100 + score end
+        end
+    end
+    return 0
+end
+
+----------------------------------------------------------------------
+-- Tabs
+----------------------------------------------------------------------
+function TabMethods:Lock(text)
+    self.Locked = true
+    self.LockLabel.Text = tostring(text or "Locked")
+    if self.Active and not self.Window.Searching then self.LockOverlay.Visible = true end
+end
+
+function TabMethods:Unlock()
+    self.Locked = false
+    self.LockOverlay.Visible = false
+end
+
+function WindowMethods:AddTab(tcfg)
+    if type(tcfg) == "string" then tcfg = { Name = tcfg } end
+    tcfg = tcfg or {}
+
+    local Tab = setmetatable({
+        Window = self, Name = tostring(tcfg.Name or tcfg.Title or "Tab"), Icon = tcfg.Icon,
+        Active = false, Locked = false, SectionCount = 0,
+    }, TabMethods)
+
+    local btn = New("TextButton", {
+        Size = UDim2.new(1, 0, 0, 32), Text = "", BackgroundTransparency = 1,
+        LayoutOrder = tcfg.Order or (#self.Tabs + 1), Parent = self.TabList,
+    })
+    BindTheme(btn, "BackgroundColor3", "Element")
+    Corner(btn, 6)
+
+    local bar = New("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(3, 14),
+        BackgroundTransparency = 1, BackgroundColor3 = Color3.new(1, 1, 1), Parent = btn,
+    })
+    Corner(bar, 2)
+    AccentGradient(bar, 90)
+
+    local textX, iconInner = 12, nil
+    if tcfg.Icon and tcfg.Icon ~= "" then
+        local holder, inner = MakeIcon(btn, tcfg.Icon, 16, "SubText", nil)
+        holder.AnchorPoint = Vector2.new(0, 0.5)
+        holder.Position = UDim2.new(0, 12, 0.5, 0)
+        iconInner = inner
+        textX = 36
+    end
+
+    local label = New("TextLabel", {
+        Position = UDim2.fromOffset(textX, 0), Size = UDim2.new(1, -(textX + 6), 1, 0), Text = Tab.Name,
+        Font = FONT_MED, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, Parent = btn,
+    })
+
+    function Tab:_Paint()
+        local t = Claux.Theme
+        local a = self.Active
+        Tween(label, { TextColor3 = a and t.Text or t.SubText }, 0.12)
+        if iconInner then
+            if iconInner:IsA("ImageLabel") then
+                Tween(iconInner, { ImageColor3 = a and t.AccentLight or t.SubText }, 0.12)
+            else
+                Tween(iconInner, { TextColor3 = a and t.AccentLight or t.SubText }, 0.12)
+            end
+        end
+        Tween(btn, { BackgroundTransparency = a and 0 or 1 }, 0.12)
+        Tween(bar, { BackgroundTransparency = a and 0 or 1 }, 0.12)
+    end
+    OnTheme(btn, function() Tab:_Paint() end)
+
+    btn.MouseEnter:Connect(function()
+        if not Tab.Active then Tween(btn, { BackgroundTransparency = 0.6 }, 0.1) end
+    end)
+    btn.MouseLeave:Connect(function()
+        if not Tab.Active then Tween(btn, { BackgroundTransparency = 1 }, 0.1) end
+    end)
+
+    local page = New("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3, ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false, Parent = self.Pages,
+    })
+    BindTheme(page, "ScrollBarImageColor3", "Accent")
+    Pad(page, 10, 12, 4, 10)
+    List(page, 8)
+    Tab.Page = page
+
+    local lockOverlay = New("Frame", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0.25, BackgroundColor3 = Color3.new(0, 0, 0),
+        Active = true, Visible = false, ZIndex = 10, Parent = self.Pages,
+    })
+    local lockLabel = New("TextLabel", { Size = UDim2.fromScale(1, 1), Text = "Locked", Font = FONT_MED, TextSize = 14, ZIndex = 11, Parent = lockOverlay })
+    BindTheme(lockLabel, "TextColor3", "Text")
+    Tab.LockOverlay, Tab.LockLabel = lockOverlay, lockLabel
+
+    btn.Activated:Connect(function() self:SelectTab(Tab) end)
+
+    table.insert(self.Tabs, Tab)
+    if not self.CurrentTab then self:SelectTab(Tab) end
+    return Tab
+end
+
+function WindowMethods:SelectTab(tab)
+    if type(tab) == "string" then
+        for _, t in ipairs(self.Tabs) do
+            if t.Name == tab then
+                tab = t
+                break
+            end
+        end
+    end
+    if type(tab) ~= "table" or not tab.Page then return end
+    Claux:_ClosePopup()
+    self.CurrentTab = tab
+    for _, t in ipairs(self.Tabs) do
+        local active = (t == tab)
+        t.Active = active
+        t.Page.Visible = active and not self.Searching
+        t.LockOverlay.Visible = active and t.Locked and not self.Searching
+        t:_Paint()
+    end
+    if not self.Searching then self.PageTitle.Text = tab.Name end
+end
+
+----------------------------------------------------------------------
+-- Search (Chloex-style fuzzy search, results page)
+----------------------------------------------------------------------
+function WindowMethods:_GoTo(entry)
+    self.SearchBox.Text = ""
+    self:SelectTab(entry.Tab)
+    entry.Section:SetOpen(true)
+    task.delay(0.08, function()
+        local page = entry.Tab.Page
+        if not entry.Frame.Parent then return end
+        local y = entry.Frame.AbsolutePosition.Y - page.AbsolutePosition.Y + page.CanvasPosition.Y
+        page.CanvasPosition = Vector2.new(0, math.max(0, y - 10))
+        local s = New("UIStroke", { Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Color = Claux.Theme.Accent, Parent = entry.Frame })
+        Tween(s, { Transparency = 1 }, 1.2)
+        task.delay(1.3, function() s:Destroy() end)
+    end)
+end
+
+function WindowMethods:_RunSearch(q)
+    q = Trim(q)
+    if q == "" then
+        self.Searching = false
+        self.SearchPage.Visible = false
+        if self.CurrentTab then self:SelectTab(self.CurrentTab) end
+        return
+    end
+
+    self.Searching = true
+    Claux:_ClosePopup()
+    for _, t in ipairs(self.Tabs) do
+        t.Page.Visible = false
+        t.LockOverlay.Visible = false
+    end
+    self.PageTitle.Text = "Search"
+
+    local page = self.SearchPage
+    page.Visible = true
+    for _, c in ipairs(page:GetChildren()) do
+        if c:IsA("GuiObject") then c:Destroy() end
+    end
+
+    local results = {}
+    for _, e in ipairs(self.SearchRegistry) do
+        local score = math.max(SmartMatch(q, e.Title), SmartMatch(q, e.Content) - 200, SmartMatch(q, e.Section.Title) - 400)
+        if score > 0 then results[#results + 1] = { Entry = e, Score = score } end
+    end
+    table.sort(results, function(a, b) return a.Score > b.Score end)
+
+    if #results == 0 then
+        local none = New("TextLabel", { Size = UDim2.new(1, 0, 0, 30), Text = "Tidak ada hasil untuk \"" .. q .. "\".", TextSize = 12, LayoutOrder = 1, Parent = page })
+        BindTheme(none, "TextColor3", "SubText")
+        return
+    end
+
+    for i = 1, math.min(#results, 30) do
+        local e = results[i].Entry
+        local row = New("TextButton", { Size = UDim2.new(1, 0, 0, 40), Text = "", BackgroundTransparency = 0, LayoutOrder = i, Parent = page })
+        BindTheme(row, "BackgroundColor3", "Element")
+        Corner(row, 6)
+        local t1 = New("TextLabel", { Position = UDim2.fromOffset(10, 5), Size = UDim2.new(1, -20, 0, 16), Text = tostring(e.Title), Font = FONT_MED, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
+        BindTheme(t1, "TextColor3", "Text")
+        local t2 = New("TextLabel", { Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 13), Text = e.Tab.Name .. "  >  " .. e.Section.Title, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
+        BindTheme(t2, "TextColor3", "SubText")
+        row.MouseEnter:Connect(function() Tween(row, { BackgroundColor3 = Claux.Theme.ElementHover }, 0.1) end)
+        row.MouseLeave:Connect(function() Tween(row, { BackgroundColor3 = Claux.Theme.Element }, 0.1) end)
+        row.Activated:Connect(function() self:_GoTo(e) end)
+    end
+end
+
+function WindowMethods:FocusSearch()
+    if not self.Visible then self:SetVisible(true) end
+    if self.SearchBox then self.SearchBox:CaptureFocus() end
+end
+
+----------------------------------------------------------------------
+-- Blur / visibility
+----------------------------------------------------------------------
+function Claux:_UpdateBlur()
+    local want = false
+    for _, w in ipairs(self.Windows) do
+        if w.Visible and w.BlurEnabled then want = true end
+    end
+    if want then
+        if not self.Blur or not self.Blur.Parent then
+            self.Blur = New("BlurEffect", { Name = RandomName(), Size = 0, Parent = GetCamera() or Lighting })
+        end
+        Tween(self.Blur, { Size = 14 }, 0.25)
+    elseif self.Blur and self.Blur.Parent then
+        Tween(self.Blur, { Size = 0 }, 0.25)
+    end
+end
+
+function WindowMethods:SetVisible(v)
+    v = v and true or false
+    self.Visible = v
+    Claux:_ClosePopup()
+    self.Holder.Visible = v
+    if v then
+        self.UIScale.Scale = 0.94
+        Tween(self.UIScale, { Scale = 1 }, 0.18)
+    end
+    Claux:_UpdateBlur()
+    if self.LogoButton then self.LogoButton.Visible = (not v) or IsMobile or self.AlwaysShowLogo end
+end
+function WindowMethods:Toggle() self:SetVisible(not self.Visible) end
+function WindowMethods:Show() self:SetVisible(true) end
+function WindowMethods:Hide() self:SetVisible(false) end
+
+function WindowMethods:SetTitle(t)
+    self.Title = tostring(t or "")
+    self.TitleLabel.Text = self.Title
+end
+
+function WindowMethods:Destroy() Claux:Unload() end
+
+-- Pass-through helpers so scripts can do Window:SaveConfigAs("x") etc.
+for _, name in ipairs({
+    "SaveConfig", "GetConfigs", "SaveConfigAs", "LoadConfigByName", "DeleteConfig",
+    "SetAutoLoad", "GetAutoLoad", "ExportConfig", "ImportConfig", "Notify", "SetTheme", "SetAccent", "Confirm",
+}) do
+    WindowMethods[name] = function(_, ...) return Claux[name](Claux, ...) end
+end
+
+----------------------------------------------------------------------
+-- Watermark + keybind list (Neverlose extras)
+----------------------------------------------------------------------
+function Claux:SetWatermark(enabled, title)
+    if not enabled then
+        if self.Watermark then self.Watermark.Visible = false end
+        return
+    end
+    EnsureGui()
+    if not self.Watermark or not self.Watermark.Parent then
+        local f = New("Frame", {
+            Name = "Watermark", Position = UDim2.fromOffset(12, 12), Size = UDim2.fromOffset(0, 26),
+            AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 0, ZIndex = 60, Parent = self.Gui,
+        })
+        BindTheme(f, "BackgroundColor3", "Section")
+        Corner(f, 6)
+        Stroke(f, "Outline")
+        Pad(f, 10, 10, 0, 0)
+        local line = New("Frame", { Size = UDim2.new(1, 20, 0, 2), Position = UDim2.fromOffset(-10, 0), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), Parent = f })
+        AccentGradient(line, 0)
+        local text = New("TextLabel", { Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = "", Font = FONT_MED, TextSize = 12, Parent = f })
+        BindTheme(text, "TextColor3", "Text")
+        self.Watermark, self.WatermarkText = f, text
+
+        local frames, elapsed, fps = 0, 0, 60
+        Connect(RunService.Heartbeat, function(dt)
+            frames = frames + 1
+            elapsed = elapsed + dt
+            if elapsed >= 0.5 then
+                fps = math.floor(frames / elapsed + 0.5)
+                frames, elapsed = 0, 0
+                if self.Watermark and self.Watermark.Visible then
+                    local ping = 0
+                    pcall(function() ping = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue() + 0.5) end)
+                    self.WatermarkText.Text = string.format("%s  |  %s  |  %d fps  |  %d ms", self.WatermarkTitle or "Claux", LocalPlayer.DisplayName, fps, ping)
+                end
+            end
+        end)
+    end
+    self.WatermarkTitle = title or self.WatermarkTitle or "Claux"
+    self.Watermark.Visible = true
+end
+
+function Claux:SetKeybindList(enabled)
+    self.KeybindListEnabled = enabled and true or false
+    if not enabled then
+        if self.KeybindFrame then self.KeybindFrame.Visible = false end
+        return
+    end
+    EnsureGui()
+    if not self.KeybindFrame or not self.KeybindFrame.Parent then
+        local f = New("Frame", {
+            Name = "KeybindList", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0),
+            Size = UDim2.fromOffset(170, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 0, ZIndex = 60, Parent = self.Gui,
+        })
+        BindTheme(f, "BackgroundColor3", "Section")
+        Corner(f, 6)
+        Stroke(f, "Outline")
+        List(f, 0)
+        local head = New("TextLabel", { Size = UDim2.new(1, 0, 0, 24), Text = "Keybinds", Font = FONT_BOLD, TextSize = 12, LayoutOrder = 1, Parent = f })
+        BindTheme(head, "TextColor3", "Text")
+        local line = New("Frame", { Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 0, BackgroundColor3 = Color3.new(1, 1, 1), LayoutOrder = 2, Parent = f })
+        AccentGradient(line, 0)
+        local holder = New("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3, Parent = f })
+        Pad(holder, 8, 8, 4, 6)
+        List(holder, 2)
+        self.KeybindFrame, self.KeybindHolder = f, holder
+    end
+    self:_RefreshKeybindList()
+end
+
+function Claux:_RefreshKeybindList()
+    if not self.KeybindListEnabled or not self.KeybindFrame or not self.KeybindHolder then return end
+    for _, c in ipairs(self.KeybindHolder:GetChildren()) do
+        if c:IsA("GuiObject") then c:Destroy() end
+    end
+    local count = 0
+    for _, kb in ipairs(self.Keybinds) do
+        if kb.TitleText and not kb.Hidden and kb.Key then
+            count = count + 1
+            local active = (kb.Owner and kb.Owner.Value) or kb.State
+            local row = New("Frame", { Size = UDim2.new(1, 0, 0, 18), LayoutOrder = count, Parent = self.KeybindHolder })
+            local name = New("TextLabel", { Size = UDim2.new(1, -50, 1, 0), Text = kb.TitleText, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
+            name.TextColor3 = active and self.Theme.Text or self.Theme.SubText
+            local key = New("TextLabel", { AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.new(0, 46, 1, 0), Text = "[" .. KeyName(kb.Key) .. "]", Font = FONT_MED, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right, Parent = row })
+            key.TextColor3 = active and self.Theme.Accent or self.Theme.SubText
+        end
+    end
+    self.KeybindFrame.Visible = count > 0
+end
+
+-- Toggles change the "active" colour in the keybind list.
+local BaseChanged = Claux._Changed
+function Claux:_Changed(el)
+    BaseChanged(self, el)
+    if el.Type == "Toggle" then self:_RefreshKeybindList() end
+end
+
+----------------------------------------------------------------------
+-- Window
+----------------------------------------------------------------------
+function Claux:Window(cfg)
+    cfg = type(cfg) == "table" and cfg or {}
+    EnsureGui()
+
+    -- theme / accent
+    local bgImage = cfg.Background
+    if type(cfg.Theme) == "string" then
+        if cfg.Theme:match("^%d+$") then
+            bgImage = bgImage or cfg.Theme -- Chloex used "Theme" for a background asset id
+        elseif Themes[cfg.Theme] then
+            self:SetTheme(cfg.Theme)
+        end
+    end
+    if typeof(cfg.Color) == "Color3" then self:SetAccent(cfg.Color) end
+
+    -- config paths
+    Cfg.GameName = GetGameName()
+    local folder = SanitizeName(cfg.Folder)
+    if folder == "" then folder = Cfg.GameName end
+    SetupPaths(folder)
+    Cfg.Version = cfg.Version or 1
+    Cfg.VersionReset = cfg.VersionReset == true
+    if cfg.AutoSave == false then Cfg.AutoSave = false end
+
+    -- key system gate
+    if cfg.KeySystem then
+        if not RunKeyGate(cfg.KeySystem, folder) then return nil end
+    end
+
+    self:LoadConfigFromFile()
+
+    local Window = setmetatable({
+        Title = tostring(cfg.Title or "Claux"), Tabs = {}, SearchRegistry = {}, Visible = true, Searching = false,
+        BlurEnabled = cfg.Blur ~= false, AlwaysShowLogo = cfg.AlwaysShowLogo == true,
+    }, WindowMethods)
+    table.insert(self.Windows, Window)
+
+    -- sizes
+    local baseW, baseH = IsMobile and 480 or 640, IsMobile and 280 or 400
+    if typeof(cfg.Size) == "UDim2" then
+        baseW, baseH = cfg.Size.X.Offset, cfg.Size.Y.Offset
+    elseif typeof(cfg.Size) == "Vector2" then
+        baseW, baseH = cfg.Size.X, cfg.Size.Y
+    end
+    local cam = GetCamera()
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    local W, H = math.min(baseW, vp.X - 24), math.min(baseH, vp.Y - 24)
+    local tabWidth = Clamp(cfg["Tab Width"] or cfg.TabWidth or (IsMobile and 110 or 140), 90, math.max(90, W - 220))
+    local TOP = 40
+
+    -- holder + shadow + main
+    local Holder = New("Frame", {
+        Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(W, H), Parent = self.Gui,
+    })
+    local UIScaleObj = New("UIScale", { Scale = 1, Parent = Holder })
+    New("ImageLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, 44, 1, 44),
+        Image = "rbxassetid://6015897843", ImageColor3 = Color3.new(0, 0, 0), ImageTransparency = 0.5,
+        ScaleType = Enum.ScaleType.Slice, SliceCenter = Rect.new(49, 49, 450, 450), ZIndex = 0, Parent = Holder,
+    })
+    local Main = New("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0.06, ZIndex = 1, ClipsDescendants = true, Parent = Holder })
+    BindTheme(Main, "BackgroundColor3", "Background")
+    Corner(Main, 8)
+    Stroke(Main, "Outline")
+
+    local bgRes = ResolveImage(bgImage)
+    if bgRes then
+        local bg = New("ImageLabel", { Size = UDim2.fromScale(1, 1), Image = bgRes, ImageTransparency = 0.85, ScaleType = Enum.ScaleType.Crop, ZIndex = 0, Parent = Main })
+        Corner(bg, 8)
+    end
+
+    -- top bar (drag handle)
+    local Topbar = New("TextButton", { Size = UDim2.new(1, 0, 0, TOP), Text = "", Parent = Main })
+    local logo = MakeLogo(Topbar, 26, cfg.Image)
+    logo.Position = UDim2.fromOffset(10, 7)
+
+    local hasFooter = cfg.Footer and tostring(cfg.Footer) ~= ""
+    local TitleLabel = New("TextLabel", {
+        Position = UDim2.fromOffset(44, hasFooter and 5 or 12), Size = UDim2.new(1, -240, 0, 16), Text = Window.Title,
+        Font = FONT_BOLD, TextSize = 14, TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, Parent = Topbar,
+    })
+    AccentGradient(TitleLabel, 0)
+    Window.TitleLabel = TitleLabel
+    if hasFooter then
+        local footer = New("TextLabel", {
+            Position = UDim2.fromOffset(44, 22), Size = UDim2.new(1, -240, 0, 12), Text = tostring(cfg.Footer), TextSize = 10,
+            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = Topbar,
+        })
+        BindTheme(footer, "TextColor3", "SubText")
+    end
+
+    local Controls = New("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0, TOP / 2), Size = UDim2.fromOffset(0, 26),
+        AutomaticSize = Enum.AutomaticSize.X, Parent = Topbar,
+    })
+    List(Controls, 6, Enum.FillDirection.Horizontal, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
+
+    -- search box
+    local SearchWrap = New("Frame", { Size = UDim2.fromOffset(IsMobile and 100 or 150, 26), BackgroundTransparency = 0, LayoutOrder = 1, Parent = Controls })
+    BindTheme(SearchWrap, "BackgroundColor3", "Element")
+    Corner(SearchWrap, 6)
+    Stroke(SearchWrap, "Outline")
+    local sIcon = MakeIcon(SearchWrap, "search", 13, "SubText", "?")
+    sIcon.AnchorPoint = Vector2.new(0, 0.5)
+    sIcon.Position = UDim2.new(0, 8, 0.5, 0)
+    local SearchBox = New("TextBox", {
+        Position = UDim2.fromOffset(27, 0), Size = UDim2.new(1, -33, 1, 0), Text = "", PlaceholderText = "Search...",
+        ClearTextOnFocus = false, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Parent = SearchWrap,
+    })
+    BindTheme(SearchBox, "TextColor3", "Text")
+    BindTheme(SearchBox, "PlaceholderColor3", "SubText")
+    SearchWrap.Visible = cfg.Search ~= false
+    Window.SearchBox = SearchBox
+
+    local function IconButton(order, icon, fallback, cb)
+        local b = New("TextButton", { Size = UDim2.fromOffset(26, 26), Text = "", LayoutOrder = order, Parent = Controls })
+        BindTheme(b, "BackgroundColor3", "Element")
+        Corner(b, 6)
+        local holder = MakeIcon(b, icon, 15, "SubText", fallback)
+        holder.AnchorPoint = Vector2.new(0.5, 0.5)
+        holder.Position = UDim2.fromScale(0.5, 0.5)
+        b.MouseEnter:Connect(function() b.BackgroundTransparency = 0 end)
+        b.MouseLeave:Connect(function() b.BackgroundTransparency = 1 end)
+        b.Activated:Connect(cb)
+        return b
+    end
+    if cfg.Discord and tostring(cfg.Discord) ~= "" then
+        IconButton(2, "message-circle", "D", function() JoinDiscord(cfg.Discord) end)
+    end
+    IconButton(3, "minus", "-", function() Window:SetVisible(false) end)
+    IconButton(4, "x", "x", function()
+        self:Confirm("Close " .. Window.Title, "UI akan di-unload sepenuhnya. Config tetap tersimpan.", "Unload", function() self:Unload() end)
+    end)
+
+    local topLine = New("Frame", { Position = UDim2.fromOffset(0, TOP), Size = UDim2.new(1, 0, 0, 1), BackgroundTransparency = 0, Parent = Main })
+    BindTheme(topLine, "BackgroundColor3", "Outline")
+
+    -- sidebar
+    local Sidebar = New("Frame", { Position = UDim2.fromOffset(0, TOP + 1), Size = UDim2.new(0, tabWidth, 1, -(TOP + 1)), Parent = Main })
+    local TabList = New("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, -52), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 0, Parent = Sidebar,
+    })
+    Pad(TabList, 8, 8, 8, 8)
+    List(TabList, 3)
+
+    local Profile = New("Frame", { Position = UDim2.new(0, 0, 1, -52), Size = UDim2.new(1, 0, 0, 52), Parent = Sidebar })
+    local pLine = New("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundTransparency = 0, Parent = Profile })
+    BindTheme(pLine, "BackgroundColor3", "Outline")
+    local Avatar = New("ImageLabel", { Position = UDim2.fromOffset(10, 11), Size = UDim2.fromOffset(30, 30), BackgroundTransparency = 0, Parent = Profile })
+    BindTheme(Avatar, "BackgroundColor3", "Element")
+    Corner(Avatar, 15)
+    task.spawn(function()
+        local ok, img = pcall(function()
+            return Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+        end)
+        if ok and img and Avatar.Parent then Avatar.Image = img end
+    end)
+    local pName = New("TextLabel", {
+        Position = UDim2.fromOffset(48, 10), Size = UDim2.new(1, -54, 0, 15), Text = LocalPlayer.DisplayName, Font = FONT_MED, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = Profile,
+    })
+    BindTheme(pName, "TextColor3", "Text")
+    local pSub = New("TextLabel", {
+        Position = UDim2.fromOffset(48, 26), Size = UDim2.new(1, -54, 0, 12),
+        Text = (cfg.Author and tostring(cfg.Author) ~= "") and tostring(cfg.Author) or ("@" .. LocalPlayer.Name), TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = Profile,
+    })
+    BindTheme(pSub, "TextColor3", "SubText")
+
+    local vLine = New("Frame", { Position = UDim2.fromOffset(tabWidth, TOP + 1), Size = UDim2.new(0, 1, 1, -(TOP + 1)), BackgroundTransparency = 0, Parent = Main })
+    BindTheme(vLine, "BackgroundColor3", "Outline")
+
+    -- content
+    local Content = New("Frame", { Position = UDim2.fromOffset(tabWidth + 1, TOP + 1), Size = UDim2.new(1, -(tabWidth + 1), 1, -(TOP + 1)), Parent = Main })
+    local PageTitle = New("TextLabel", {
+        Position = UDim2.fromOffset(14, 8), Size = UDim2.new(1, -28, 0, 20), Text = "", Font = FONT_BOLD, TextSize = 15,
+        TextXAlignment = Enum.TextXAlignment.Left, Parent = Content,
+    })
+    BindTheme(PageTitle, "TextColor3", "Text")
+    local Pages = New("Frame", { Position = UDim2.fromOffset(0, 34), Size = UDim2.new(1, 0, 1, -34), Parent = Content })
+
+    local SearchPage = New("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3, Visible = false, Parent = Pages,
+    })
+    BindTheme(SearchPage, "ScrollBarImageColor3", "Accent")
+    Pad(SearchPage, 10, 12, 4, 10)
+    List(SearchPage, 6)
+
+    Window.Holder, Window.Main, Window.UIScale = Holder, Main, UIScaleObj
+    Window.TabList, Window.Pages, Window.PageTitle, Window.SearchPage = TabList, Pages, PageTitle, SearchPage
+
+    SearchBox:GetPropertyChangedSignal("Text"):Connect(function() Window:_RunSearch(SearchBox.Text) end)
+
+    -- dragging (the resize handle from Chloex is intentionally NOT included)
+    local dragging, dragStart, startPos = false, nil, nil
+    Topbar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = Holder.Position
+        end
+    end)
+    Connect(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            local c = GetCamera()
+            local v = c and c.ViewportSize or Vector2.new(1280, 720)
+            local half = Holder.AbsoluteSize / 2
+            local nx = Clamp(startPos.X.Offset + d.X, -(v.X / 2 + half.X - 60), v.X / 2 + half.X - 60)
+            local ny = Clamp(startPos.Y.Offset + d.Y, -(v.Y / 2 - half.Y), v.Y / 2 + half.Y - 40)
+            Holder.Position = UDim2.new(startPos.X.Scale, nx, startPos.Y.Scale, ny)
+        end
+    end)
+    Connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    -- floating logo button (shown when minimised, always on mobile)
+    local logoSize = cfg.LogoButtonSize or 50
+    local LogoBtn = New("TextButton", {
+        Name = "LogoButton", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 20, 0.5, 0),
+        Size = UDim2.fromOffset(logoSize, logoSize), Text = "", BackgroundTransparency = 0, Visible = IsMobile, ZIndex = 50, Parent = self.Gui,
+    })
+    BindTheme(LogoBtn, "BackgroundColor3", "Background")
+    Corner(LogoBtn, math.floor(logoSize / 2))
+    Stroke(LogoBtn, "Accent", 1.5)
+    local lg = MakeLogo(LogoBtn, logoSize - 16, cfg.Image)
+    lg.AnchorPoint = Vector2.new(0.5, 0.5)
+    lg.Position = UDim2.fromScale(0.5, 0.5)
+    Window.LogoButton = LogoBtn
+
+    local ldrag, lstart, lpos, moved = false, nil, nil, false
+    LogoBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ldrag, moved = true, false
+            lstart, lpos = input.Position, LogoBtn.Position
+        end
+    end)
+    Connect(UserInputService.InputChanged, function(input)
+        if ldrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - lstart
+            if d.Magnitude > 6 then moved = true end
+            if moved then LogoBtn.Position = UDim2.new(lpos.X.Scale, lpos.X.Offset + d.X, lpos.Y.Scale, lpos.Y.Offset + d.Y) end
+        end
+    end)
+    Connect(UserInputService.InputEnded, function(input)
+        if ldrag and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            ldrag = false
+            if not moved then Window:Toggle() end
+        end
+    end)
+
+    -- menu key
+    local MenuBind = { Key = ParseKey(cfg.ToggleKey or cfg.MenuKey) or Enum.KeyCode.Insert, Hidden = true }
+    function MenuBind:_Press(code)
+        if self.Key and code == self.Key then Window:Toggle() end
+    end
+    function MenuBind:_Release() end
+    table.insert(self.Keybinds, MenuBind)
+    Window.MenuBind = MenuBind
+
+    Window:SetVisible(true)
+
+    -- settings tab + autoload (deferred so the script can finish building its own tabs first)
+    if cfg.Settings ~= false then
+        task.defer(function()
+            if not Window.SettingsTab then Window:AddSettingsTab() end
+        end)
+    end
+    task.defer(function()
+        task.wait(0.5)
+        local auto = self:GetAutoLoad()
+        if auto ~= "" then
+            local ok = self:LoadConfigByName(auto)
+            if ok then self:Notify({ Title = "Config", Content = "Auto load: " .. auto, Type = "Success", Duration = 3 }) end
+        end
+    end)
+
+    return Window
+end
+
+----------------------------------------------------------------------
+-- Built-in tabs
+----------------------------------------------------------------------
+function WindowMethods:InfoTab(icfg)
+    icfg = icfg or {}
+    local Tab = self:AddTab({ Name = icfg.Name or "Info", Icon = icfg.Icon or "info" })
+    local About = Tab:AddSection("About", true)
+    About:AddParagraph({ Title = icfg.Title or self.Title, Content = icfg.Content or icfg.Description or ("Dibuat dengan Claux UI v" .. Claux.Version) })
+    if icfg.Discord and tostring(icfg.Discord) ~= "" then
+        About:AddButton({ Title = "Discord", Content = "Salin / buka link invite", Text = "Join", Callback = function() JoinDiscord(icfg.Discord) end })
+    end
+
+    local Session = Tab:AddSection("Session", true)
+    Session:AddParagraph({ Title = "Player", Content = LocalPlayer.DisplayName .. " (@" .. LocalPlayer.Name .. ")" })
+    Session:AddParagraph({ Title = "Game", Content = Cfg.GameName .. "  |  PlaceId " .. tostring(game.PlaceId) })
+    local ok, exName, exVer = pcall(function() return identifyexecutor() end)
+    if ok and exName then
+        Session:AddParagraph({ Title = "Executor", Content = tostring(exName) .. (exVer and (" " .. tostring(exVer)) or "") })
+    end
+    Session:AddParagraph({ Title = "Config", Content = HasFS and (Cfg.File or "-") or "Executor tidak mendukung file system." })
+    return Tab
+end
+
+function WindowMethods:AddSettingsTab()
+    if self.SettingsTab then return self.SettingsTab end
+    local Window = self
+    local Tab = self:AddTab({ Name = "Settings", Icon = "settings", Order = 9999 })
+    self.SettingsTab = Tab
+
+    -- Configs ---------------------------------------------------------
+    local C = Tab:AddSection("Configs")
+    local selected
+    local dd = C:AddDropdown({
+        Title = "Config", Content = "Pilih config yang tersimpan", Options = Claux:GetConfigs(), Search = true, Save = false,
+        Callback = function(v) selected = v end,
+    })
+    local nameBox = C:AddInput({ Title = "Config Name", Content = "Nama untuk config baru", Placeholder = "my-config", Save = false })
+    local autoInfo = C:AddParagraph({ Title = "Auto Load", Content = "-" })
+
+    local function RefreshList() dd:Refresh(Claux:GetConfigs()) end
+    local function UpdateAuto()
+        local a = Claux:GetAutoLoad()
+        autoInfo:SetContent(a ~= "" and a or "None")
+    end
+    UpdateAuto()
+
+    local function Need()
+        if selected and selected ~= "" then return true end
+        Claux:Notify({ Title = "Config", Content = "Pilih config dulu.", Type = "Warning" })
+        return false
+    end
+
+    C:AddButton({ Title = "Create Config", Text = "Create", Callback = function()
+        local name = SanitizeName(nameBox:Get())
+        local ok, err = Claux:SaveConfigAs(name)
+        if ok then
+            Claux:Notify({ Title = "Config", Content = "Config '" .. name .. "' dibuat.", Type = "Success" })
+            RefreshList()
+            dd:Set(name)
+        else
+            Claux:Notify({ Title = "Config", Content = tostring(err), Type = "Error" })
+        end
+    end })
+    C:AddButton({ Title = "Load Config", Text = "Load", Callback = function()
+        if not Need() then return end
+        local ok, err = Claux:LoadConfigByName(selected)
+        Claux:Notify({ Title = "Config", Content = ok and ("Loaded '" .. selected .. "'.") or tostring(err), Type = ok and "Success" or "Error" })
+    end })
+    C:AddButton({ Title = "Overwrite Config", Text = "Save", Callback = function()
+        if not Need() then return end
+        local ok, err = Claux:SaveConfigAs(selected)
+        Claux:Notify({ Title = "Config", Content = ok and ("Saved '" .. selected .. "'.") or tostring(err), Type = ok and "Success" or "Error" })
+    end })
+    C:AddButton({ Title = "Delete Config", Text = "Delete", Callback = function()
+        if not Need() then return end
+        local name = selected
+        if Claux:DeleteConfig(name) then
+            Claux:Notify({ Title = "Config", Content = "Deleted '" .. name .. "'.", Type = "Success" })
+            selected = nil
+            RefreshList()
+            dd:Set(nil, true)
+            UpdateAuto()
+        else
+            Claux:Notify({ Title = "Config", Content = "Gagal menghapus config.", Type = "Error" })
+        end
+    end })
+    C:AddButton({ Title = "Set Auto Load", Text = "Set", Callback = function()
+        if not Need() then return end
+        Claux:SetAutoLoad(selected)
+        UpdateAuto()
+        Claux:Notify({ Title = "Config", Content = "Auto load: " .. selected, Type = "Success" })
+    end })
+    C:AddButton({ Title = "Clear Auto Load", Text = "Clear", Callback = function()
+        Claux:SetAutoLoad("")
+        UpdateAuto()
+    end })
+    C:AddButton({ Title = "Refresh List", Text = "Refresh", Callback = RefreshList })
+    C:AddButton({ Title = "Export Config", Content = "Salin config saat ini ke clipboard", Text = "Copy", Callback = function()
+        local ok = SetClipboard(Claux:ExportConfig())
+        Claux:Notify({ Title = "Config", Content = ok and "Config disalin ke clipboard." or "Clipboard tidak didukung.", Type = ok and "Success" or "Error" })
+    end })
+    C:AddPanel({ Title = "Import Config", Content = "Tempel string CLAUX:...", Placeholder = "CLAUX:...", ButtonText = "Import", ClearOnPress = true, Callback = function(text)
+        local ok, err = Claux:ImportConfig(text)
+        Claux:Notify({ Title = "Config", Content = ok and "Config di-import." or tostring(err), Type = ok and "Success" or "Error" })
+    end })
+
+    -- Interface -------------------------------------------------------
+    local I = Tab:AddSection("Interface")
+    local initializing = true
+    local hasSavedAccent = Claux.ConfigData["Claux_Accent"] ~= nil
+    local accent
+
+    I:AddKeybind({
+        Title = "Menu Key", Content = "Tombol untuk buka/tutup UI", Default = self.MenuBind.Key, Modes = { "Press" },
+        HideInList = true, Flag = "Claux_MenuKey", OnChanged = function(kc) Window.MenuBind.Key = kc end,
+    })
+    I:AddDropdown({
+        Title = "Theme", Options = Claux:GetThemes(), Default = Claux.ThemeName, Flag = "Claux_Theme",
+        Callback = function(name)
+            if not name or name == Claux.ThemeName then return end
+            if Claux:SetTheme(name) and accent and not initializing and not Cfg.Applying then
+                accent:Set(Claux.Theme.Accent)
+            end
+        end,
+    })
+    accent = I:AddColorPicker({
+        Title = "Accent Color", Default = Claux.Theme.Accent, Flag = "Claux_Accent",
+        Callback = function(c)
+            if initializing and not hasSavedAccent then return end
+            if c ~= Claux.Theme.Accent then Claux:SetAccent(c) end
+        end,
+    })
+    task.defer(function() initializing = false end)
+
+    I:AddSlider({
+        Title = "Window Opacity", Min = 40, Max = 100, Default = 94, Suffix = "%", Flag = "Claux_Opacity",
+        Callback = function(v) Window.Main.BackgroundTransparency = 1 - (v / 100) end,
+    })
+    I:AddToggle({
+        Title = "Background Blur", Content = "Blur di belakang UI saat terbuka", Default = self.BlurEnabled, Flag = "Claux_Blur",
+        Callback = function(v)
+            Window.BlurEnabled = v
+            Claux:_UpdateBlur()
+        end,
+    })
+    I:AddToggle({ Title = "Notifications", Default = true, Flag = "Claux_Notifs", Callback = function(v) Claux.NotificationsEnabled = v end })
+    I:AddToggle({ Title = "Watermark", Default = false, Flag = "Claux_Watermark", Callback = function(v) Claux:SetWatermark(v, Window.Title) end })
+    I:AddToggle({ Title = "Keybind List", Default = false, Flag = "Claux_KeybindList", Callback = function(v) Claux:SetKeybindList(v) end })
+    I:AddButton({ Title = "Unload UI", Content = "Tutup dan hapus UI sepenuhnya", Text = "Unload", Callback = function()
+        Claux:Confirm("Unload " .. Window.Title, "UI akan di-unload sepenuhnya. Config tetap tersimpan.", "Unload", function() Claux:Unload() end)
+    end })
+
+    return Tab
+end
+
+----------------------------------------------------------------------
+-- Unload
+----------------------------------------------------------------------
+function Claux:Unload()
+    pcall(function() self:SaveConfig(true) end)
+    for _, c in ipairs(self.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    self.Connections = {}
+    if self.Blur then pcall(function() self.Blur:Destroy() end) end
+    if self.Gui then pcall(function() self.Gui:Destroy() end) end
+    self.Gui, self.Blur, self.Watermark, self.KeybindFrame = nil, nil, nil, nil
+    self.Windows, self.Keybinds, self.Elements, self.Flags = {}, {}, {}, {}
+    self.Listening, self.CurrentPopup = nil, nil
+    ActiveNotifs = {}
+    ActiveDrag, ActiveDragPage = nil, nil
+    for i = #ThemeBindings, 1, -1 do table.remove(ThemeBindings, i) end
+    for i = #ThemeCallbacks, 1, -1 do table.remove(ThemeCallbacks, i) end
+    if genv.Claux == self then genv.Claux = nil end
+end
+
+genv.Claux = Claux
+return Claux
